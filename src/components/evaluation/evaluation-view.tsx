@@ -29,8 +29,7 @@ type FilterType =
   | "genuine_bills"
   | "non_bills"
   | "ocr_failures"
-  | "extraction_failures"
-  | "awaiting_ground_truth";
+  | "extraction_failures";
 
 export function EvaluationView() {
   const {
@@ -87,11 +86,6 @@ export function EvaluationView() {
             evaluation.amount === "Not extracted" ||
             evaluation.category === "Incorrect" ||
             evaluation.category === "Not extracted"
-          );
-        case "awaiting_ground_truth":
-          return (
-            evaluation.expectedType === "Missing ground truth" ||
-            evaluation.overall === "Awaiting ground truth"
           );
         case "all":
         default:
@@ -319,7 +313,6 @@ export function EvaluationView() {
             { id: "non_bills", label: "Non-Bills" },
             { id: "ocr_failures", label: "OCR Failures" },
             { id: "extraction_failures", label: "Extraction Failures" },
-            { id: "awaiting_ground_truth", label: "Awaiting Ground Truth" },
           ].map((tab) => (
             <button
               key={tab.id}
@@ -373,8 +366,7 @@ export function EvaluationView() {
                       onClick={() =>
                         setSelectedAttemptState({
                           attempt,
-                          initialEditGt:
-                            evalResult.expectedType === "Missing ground truth",
+                          initialEditGt: false,
                         })
                       }
                       className="hover:bg-paper-2/50 cursor-pointer transition-colors"
@@ -427,21 +419,7 @@ export function EvaluationView() {
                       </td>
 
                       <td className="py-3 px-3 text-right">
-                        {evalResult.action === "Review missing ground truth" ? (
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              setSelectedAttemptState({
-                                attempt,
-                                initialEditGt: true,
-                              });
-                            }}
-                            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs bg-accent/10 text-accent hover:bg-accent/20 font-medium transition-colors"
-                            title="Add expected ground-truth values to evaluate this scan"
-                          >
-                            Review GT
-                          </button>
-                        ) : evalResult.action === "Retry scan" ? (
+                        {evalResult.action === "Retry scan" ? (
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -518,11 +496,10 @@ function ExpectedBadge({ status }: { status: ExpectedTypeStatus }) {
           Non-bill
         </span>
       );
-    case "Missing ground truth":
     default:
       return (
-        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
-          Missing ground truth
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-800">
+          Bill
         </span>
       );
   }
@@ -559,16 +536,10 @@ function StatusBadge({
         </span>
       );
     case "Not evaluated":
+    default:
       return (
         <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-ink-muted bg-paper-2">
           Not evaluated
-        </span>
-      );
-    case "Awaiting ground truth":
-    default:
-      return (
-        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
-          Awaiting GT
         </span>
       );
   }
@@ -589,16 +560,10 @@ function OverallBadge({ status }: { status: OverallStatus }) {
         </span>
       );
     case "Incorrect":
+    default:
       return (
         <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-red-100 text-red-800">
           INCORRECT
-        </span>
-      );
-    case "Awaiting ground truth":
-    default:
-      return (
-        <span className="inline-block px-2 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
-          AWAITING GT
         </span>
       );
   }

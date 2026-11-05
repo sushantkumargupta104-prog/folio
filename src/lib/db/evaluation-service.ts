@@ -21,24 +21,129 @@ import { createId } from "@/utils/id";
 // COMPARISON AND EVALUATION LOGIC
 // ----------------------------------------------------
 
+export function populateDefaultGroundTruth(attempt: ScanAttempt): boolean {
+  let changed = false;
+
+  // 1. If expectedIsBill is not set, default to predictedIsBill (or true if predictedIsBill is null or pending)
+  if (attempt.expectedIsBill === null) {
+    if (attempt.predictedIsBill !== null) {
+      attempt.expectedIsBill = attempt.predictedIsBill;
+      changed = true;
+    } else if (
+      attempt.processingStatus === "completed" ||
+      attempt.processingStatus === "extracting" ||
+      attempt.processingStatus === "detecting"
+    ) {
+      attempt.expectedIsBill = true;
+      changed = true;
+    }
+  }
+
+  // 2. Default extraction ground truth to whatever was extracted
+  if (attempt.expectedIsBill === true || (attempt.expectedIsBill === null && attempt.predictedIsBill !== false)) {
+    if (attempt.expectedMerchant === null && attempt.extractedMerchant !== null) {
+      attempt.expectedMerchant = attempt.extractedMerchant;
+      changed = true;
+    }
+    if (attempt.expectedDate === null && attempt.extractedDate !== null) {
+      attempt.expectedDate = attempt.extractedDate;
+      changed = true;
+    }
+    if (attempt.expectedAmount === null && attempt.extractedAmount !== null) {
+      attempt.expectedAmount = attempt.extractedAmount;
+      changed = true;
+    }
+    if (attempt.expectedCategory === null && attempt.extractedCategory !== null) {
+      attempt.expectedCategory = attempt.extractedCategory;
+      changed = true;
+    }
+  } else if (attempt.expectedIsBill === false) {
+    if (
+      attempt.expectedMerchant !== null ||
+      attempt.expectedDate !== null ||
+      attempt.expectedAmount !== null ||
+      attempt.expectedCategory !== null
+    ) {
+      attempt.expectedMerchant = null;
+      attempt.expectedDate = null;
+      attempt.expectedAmount = null;
+      attempt.expectedCategory = null;
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+export function resolveEffectiveGroundTruth(attempt: ScanAttempt): {
+  expectedIsBill: boolean;
+  expectedMerchant: string | null;
+  expectedDate: string | null;
+  expectedAmount: number | null;
+  expectedCategory: ExpenseCategory | null;
+} {
+  const isBill =
+    attempt.expectedIsBill !== null
+      ? attempt.expectedIsBill
+      : attempt.predictedIsBill !== null
+        ? attempt.predictedIsBill
+        : true;
+
+  if (!isBill) {
+    return {
+      expectedIsBill: false,
+      expectedMerchant: null,
+      expectedDate: null,
+      expectedAmount: null,
+      expectedCategory: null,
+    };
+  }
+
+  return {
+    expectedIsBill: true,
+    expectedMerchant:
+      attempt.expectedMerchant !== null
+        ? attempt.expectedMerchant
+        : attempt.extractedMerchant,
+    expectedDate:
+      attempt.expectedDate !== null
+        ? attempt.expectedDate
+        : attempt.extractedDate,
+    expectedAmount:
+      attempt.expectedAmount !== null
+        ? attempt.expectedAmount
+        : attempt.extractedAmount,
+    expectedCategory:
+      attempt.expectedCategory !== null
+        ? attempt.expectedCategory
+        : (attempt.extractedCategory as ExpenseCategory | null),
+  };
+}
+
 export function evaluateExpectedType(attempt: ScanAttempt): ExpectedTypeStatus {
-  if (attempt.expectedIsBill === true) return "Bill";
-  if (attempt.expectedIsBill === false) return "Non-bill";
-  return "Missing ground truth";
+  const isBill =
+    attempt.expectedIsBill !== null
+      ? attempt.expectedIsBill
+      : attempt.predictedIsBill !== null
+        ? attempt.predictedIsBill
+        : true;
+  return isBill ? "Bill" : "Non-bill";
 }
 
 export function evaluateClassification(attempt: ScanAttempt): ClassificationStatus {
   if (attempt.predictedIsBill === null) {
     return "Not evaluated";
   }
-  if (attempt.expectedIsBill === null) {
-    return "Not evaluated";
-  }
-  return attempt.predictedIsBill === attempt.expectedIsBill ? "Correct" : "Incorrect";
+  const expected =
+    attempt.expectedIsBill !== null
+      ? attempt.expectedIsBill
+      : attempt.predictedIsBill;
+  return attempt.predictedIsBill === expected ? "Correct" : "Incorrect";
 }
 
 export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation {
-  const expectedType = evaluateExpectedType(attempt);
+  const effectiveGt = resolveEffectiveGroundTruth(attempt);
+  const expectedType: ExpectedTypeStatus = effectiveGt.expectedIsBill ? "Bill" : "Non-bill";
   const classification = evaluateClassification(attempt);
 
   // Check if system failed before field extraction (e.g. genuine bill rejected or OCR failed)
@@ -50,8 +155,8 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
 
   // 1. Merchant extraction
   const merchant = evaluateSingleField(
-    attempt.expectedIsBill,
-    attempt.expectedMerchant,
+    effectiveGt.expectedIsBill,
+    effectiveGt.expectedMerchant,
     attempt.extractedMerchant,
     compareMerchant,
     isExtractionUnavailable,
@@ -59,8 +164,8 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
 
   // 2. Date extraction
   const date = evaluateSingleField(
-    attempt.expectedIsBill,
-    attempt.expectedDate,
+    effectiveGt.expectedIsBill,
+    effectiveGt.expectedDate,
     attempt.extractedDate,
     compareDate,
     isExtractionUnavailable,
@@ -68,8 +173,8 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
 
   // 3. Amount extraction
   const amount = evaluateSingleField(
-    attempt.expectedIsBill,
-    attempt.expectedAmount,
+    effectiveGt.expectedIsBill,
+    effectiveGt.expectedAmount,
     attempt.extractedAmount,
     compareAmount,
     isExtractionUnavailable,
@@ -77,8 +182,8 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
 
   // 4. Category extraction
   const category = evaluateSingleField(
-    attempt.expectedIsBill,
-    attempt.expectedCategory,
+    effectiveGt.expectedIsBill,
+    effectiveGt.expectedCategory,
     attempt.extractedCategory,
     compareCategory,
     isExtractionUnavailable,
@@ -93,7 +198,7 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
   ]);
 
   // 6. Functional Action
-  const action = evaluateAction(attempt, overall, expectedType);
+  const action = evaluateAction(attempt);
 
   return {
     expectedType,
@@ -108,33 +213,30 @@ export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation 
 }
 
 function evaluateSingleField<T>(
-  isBill: boolean | null,
+  isBill: boolean,
   expectedVal: T | null,
   extractedVal: T | null,
   compareFn: (extracted: T, expected: T) => boolean,
   isExtractionUnavailable: boolean,
 ): ExtractionStatus {
-  // Non-bill images: extraction is Not applicable unless test data explicitly expected it
-  if (isBill === false) {
-    if (expectedVal !== null) {
-      if (extractedVal === null) return "Not extracted";
-      return compareFn(extractedVal, expectedVal) ? "Correct" : "Incorrect";
-    }
+  // Non-bill images: extraction is Not applicable
+  if (!isBill) {
     return "Not applicable";
   }
 
-  // Missing ground truth (either classification or this specific field)
-  if (isBill === null || expectedVal === null) {
-    return "Awaiting ground truth";
-  }
-
-  // Genuine bill with expected value:
-  // If the bill was rejected before extraction or OCR failed, it's Not extracted
+  // Genuine bill:
+  // If the bill was rejected before extraction or OCR failed, or extraction produced null
   if (isExtractionUnavailable || extractedVal === null) {
     return "Not extracted";
   }
 
-  return compareFn(extractedVal, expectedVal) ? "Correct" : "Incorrect";
+  // Default expected value to extracted value if not provided
+  const effectiveExpected = expectedVal !== null ? expectedVal : extractedVal;
+  if (effectiveExpected === null) {
+    return "Not extracted";
+  }
+
+  return compareFn(extractedVal, effectiveExpected) ? "Correct" : "Incorrect";
 }
 
 function evaluateOverall(
@@ -142,38 +244,32 @@ function evaluateOverall(
   classification: ClassificationStatus,
   fieldStatuses: ExtractionStatus[],
 ): OverallStatus {
-  // If ground truth is not provided, cannot evaluate overall
-  if (attempt.expectedIsBill === null) {
-    return "Awaiting ground truth";
-  }
-
-  // For non-bills, overall primarily reflects classification correctness
-  if (attempt.expectedIsBill === false) {
-    if (classification === "Correct") return "Correct";
-    if (classification === "Incorrect") return "Incorrect";
-    return "Awaiting ground truth";
-  }
-
-  // For genuine bills:
+  // If classification is incorrect, overall is incorrect
   if (classification === "Incorrect") {
     return "Incorrect";
   }
 
-  if (classification === "Not evaluated") {
-    if (attempt.processingStatus === "failed" || attempt.ocrStatus === "failed") {
-      return "Incorrect";
-    }
-    return "Awaiting ground truth";
+  const isBill =
+    attempt.expectedIsBill !== null
+      ? attempt.expectedIsBill
+      : attempt.predictedIsBill !== null
+        ? attempt.predictedIsBill
+        : true;
+
+  // For non-bills, overall reflects classification correctness
+  if (!isBill) {
+    return classification === "Correct" ? "Correct" : "Incorrect";
   }
 
-  // classification is "Correct". Filter for applicable extraction checks
-  const applicable = fieldStatuses.filter(
-    (s) => s !== "Not applicable" && s !== "Awaiting ground truth",
-  );
+  if (classification === "Not evaluated") {
+    return "Incorrect";
+  }
+
+  // Filter for applicable extraction checks (exclude non-applicable)
+  const applicable = fieldStatuses.filter((s) => s !== "Not applicable");
 
   if (applicable.length === 0) {
-    // Classification is correct, but ground truth has not yet been supplied for any field
-    return "Awaiting ground truth";
+    return "Correct";
   }
 
   const correctCount = applicable.filter((s) => s === "Correct").length;
@@ -192,16 +288,9 @@ function evaluateOverall(
   return "Incorrect";
 }
 
-function evaluateAction(
-  attempt: ScanAttempt,
-  overall: OverallStatus,
-  expectedType: ExpectedTypeStatus,
-): ActionStatus {
+function evaluateAction(attempt: ScanAttempt): ActionStatus {
   if (attempt.processingStatus === "failed" || attempt.failureStage !== null) {
     return "Retry scan";
-  }
-  if (expectedType === "Missing ground truth" || overall === "Awaiting ground truth") {
-    return "Review missing ground truth";
   }
   return "View details";
 }
@@ -437,6 +526,9 @@ export async function createScanAttempt(options: {
       notes: gt?.notes ?? null,
     };
 
+    // Populate default ground truth from predictions if not set
+    populateDefaultGroundTruth(attempt);
+
     // Calculate initial evaluated statuses immediately
     const initialEval = evaluateScanAttempt(attempt);
     attempt.expectedTypeStatus = initialEval.expectedType;
@@ -470,6 +562,9 @@ export async function updateScanAttempt(
       ...updates,
       updatedAt: new Date().toISOString(),
     };
+
+    // By default, seed ground truth from predictions/extractions if not explicitly supplied
+    populateDefaultGroundTruth(merged);
 
     // Recalculate evaluation statuses immediately with updated values
     const evalResult = evaluateScanAttempt(merged);
@@ -512,6 +607,9 @@ export async function recalculateAndPersistAttempt(
       attempt.notes = attempt.notes ?? matched.notes ?? null;
     }
   }
+
+  // Populate default ground truth from predictions/extractions
+  populateDefaultGroundTruth(attempt);
 
   const evalResult = evaluateScanAttempt(attempt);
   const updated: ScanAttempt = {
@@ -556,6 +654,10 @@ export async function repairAllScanAttempts(): Promise<{
           attempt.notes = attempt.notes ?? matched.notes ?? null;
           updatedGt = true;
         }
+      }
+
+      if (populateDefaultGroundTruth(attempt)) {
+        updatedGt = true;
       }
 
       const evalResult = evaluateScanAttempt(attempt);
@@ -716,7 +818,7 @@ export function calculateEvaluationSummary(attempts: ScanAttempt[]): EvaluationS
       billDetectionRejections += 1;
     }
 
-    if (attempt.expectedIsBill !== null) {
+    if (attempt.expectedIsBill !== null || attempt.predictedIsBill !== null) {
       totalWithGroundTruth += 1;
     }
 

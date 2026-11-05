@@ -31,18 +31,33 @@ export function AttemptDetailModal({
   const imageUrl = useObjectUrl(attempt.imageBlob);
   const evaluation = useMemo(() => evaluateScanAttempt(attempt), [attempt]);
 
-  // Ground truth editor state
-  const [editingGt, setEditingGt] = useState(initialEditGt || attempt.expectedIsBill === null);
-  const [expectedIsBill, setExpectedIsBill] = useState<string>(
-    attempt.expectedIsBill === null ? "" : attempt.expectedIsBill ? "true" : "false",
+  // Ground truth editor state - defaults to predicted/extracted values if not explicitly set
+  const defaultIsBill =
+    attempt.expectedIsBill !== null
+      ? attempt.expectedIsBill
+        ? "true"
+        : "false"
+      : attempt.predictedIsBill === false
+        ? "false"
+        : "true";
+
+  const [editingGt, setEditingGt] = useState(initialEditGt);
+  const [expectedIsBill, setExpectedIsBill] = useState<string>(defaultIsBill);
+  const [expectedMerchant, setExpectedMerchant] = useState(
+    attempt.expectedMerchant ?? attempt.extractedMerchant ?? "",
   );
-  const [expectedMerchant, setExpectedMerchant] = useState(attempt.expectedMerchant ?? "");
-  const [expectedDate, setExpectedDate] = useState(attempt.expectedDate ?? "");
+  const [expectedDate, setExpectedDate] = useState(
+    attempt.expectedDate ?? attempt.extractedDate ?? "",
+  );
   const [expectedAmount, setExpectedAmount] = useState(
-    attempt.expectedAmount != null ? String(attempt.expectedAmount) : "",
+    attempt.expectedAmount != null
+      ? String(attempt.expectedAmount)
+      : attempt.extractedAmount != null
+        ? String(attempt.extractedAmount)
+        : "",
   );
   const [expectedCategory, setExpectedCategory] = useState<ExpenseCategory | "">(
-    attempt.expectedCategory ?? "",
+    attempt.expectedCategory ?? (attempt.extractedCategory as ExpenseCategory) ?? "",
   );
   const [datasetTag, setDatasetTag] = useState(attempt.datasetTag ?? "");
   const [notes, setNotes] = useState(attempt.notes ?? "");
@@ -226,7 +241,6 @@ export function AttemptDetailModal({
                     value={expectedIsBill}
                     onChange={(e) => setExpectedIsBill(e.target.value)}
                   >
-                    <option value="">(Missing ground truth)</option>
                     <option value="true">Bill (Genuine Bill)</option>
                     <option value="false">Non-bill (Non-Bill Image)</option>
                   </select>
@@ -474,12 +488,6 @@ function DetailStatusBadge({ status }: { status: string }) {
       return (
         <span className="inline-block px-2 py-0.5 rounded text-[11px] text-ink-muted bg-paper-2">
           Not applicable
-        </span>
-      );
-    case "Awaiting ground truth":
-      return (
-        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-amber-900 bg-amber-100/70">
-          Awaiting ground truth
         </span>
       );
     case "Not evaluated":

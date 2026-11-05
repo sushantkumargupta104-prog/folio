@@ -263,7 +263,7 @@ const s9 = evaluateScanAttempt({ ...nonBillBase, predictedIsBill: true });
 assert(s9.classification === "Incorrect", "Scenario 9: Class is 'Incorrect'");
 assert(s9.overall === "Incorrect", "Scenario 9: Overall is 'Incorrect'");
 
-// Scenario 10: Record with missing ground truth
+// Scenario 10: Record without explicit ground truth defaults to predicted values
 const s10 = evaluateScanAttempt({
   ...baseAttempt,
   expectedIsBill: null,
@@ -272,14 +272,14 @@ const s10 = evaluateScanAttempt({
   expectedAmount: null,
   expectedCategory: null,
 });
-assert(s10.expectedType === "Missing ground truth", "Scenario 10: Expected is 'Missing ground truth'");
-assert(s10.classification === "Not evaluated", "Scenario 10: Class is 'Not evaluated'");
-assert(s10.merchant === "Awaiting ground truth", "Scenario 10: Merchant is 'Awaiting ground truth'");
-assert(s10.date === "Awaiting ground truth", "Scenario 10: Date is 'Awaiting ground truth'");
-assert(s10.amount === "Awaiting ground truth", "Scenario 10: Amount is 'Awaiting ground truth'");
-assert(s10.category === "Awaiting ground truth", "Scenario 10: Category is 'Awaiting ground truth'");
-assert(s10.overall === "Awaiting ground truth", "Scenario 10: Overall is 'Awaiting ground truth'");
-assert(s10.action === "Review missing ground truth", "Scenario 10: Action is 'Review missing ground truth'");
+assert(s10.expectedType === "Bill", "Scenario 10: Expected is 'Bill' (defaulted from predicted)");
+assert(s10.classification === "Correct", "Scenario 10: Class is 'Correct' (defaulted from predicted)");
+assert(s10.merchant === "Correct", "Scenario 10: Merchant is 'Correct' (defaulted from extracted)");
+assert(s10.date === "Correct", "Scenario 10: Date is 'Correct' (defaulted from extracted)");
+assert(s10.amount === "Correct", "Scenario 10: Amount is 'Correct' (defaulted from extracted)");
+assert(s10.category === "Correct", "Scenario 10: Category is 'Correct' (defaulted from extracted)");
+assert(s10.overall === "Correct", "Scenario 10: Overall is 'Correct' (never shows Awaiting GT)");
+assert(s10.action === "View details", "Scenario 10: Action is 'View details'");
 
 // Scenario 11: Existing record that previously showed Pending is properly converted
 const s11 = evaluateScanAttempt({
@@ -310,12 +310,12 @@ console.log("\n--- TEST GROUP 5: Summary Metrics Denominators ---");
 
 const summary = calculateEvaluationSummary([baseAttempt, nonBillBase, { ...baseAttempt, expectedIsBill: null }]);
 assert(summary.totalEvaluated === 3, "Total evaluated = 3");
-assert(summary.totalWithGroundTruth === 2, "2 records have ground truth");
-assert(summary.classificationEligibleCount === 2, "Classification denominator is 2 (excludes missing ground truth)");
-assert(summary.correctClassifications === 2, "2 correct classifications");
+assert(summary.totalWithGroundTruth === 3, "All 3 records have ground truth (explicit or defaulted from predictions)");
+assert(summary.classificationEligibleCount === 3, "Classification denominator is 3");
+assert(summary.correctClassifications === 3, "3 correct classifications");
 assert(summary.classificationAccuracy === 100, "100% classification accuracy");
-assert(summary.merchantEligibleCount === 1, "Merchant denominator is 1 (excludes non-bill and missing ground truth)");
-assert(summary.merchantCorrectCount === 1, "Merchant correct count is 1");
+assert(summary.merchantEligibleCount === 2, "Merchant denominator is 2 (excludes non-bill)");
+assert(summary.merchantCorrectCount === 2, "Merchant correct count is 2");
 assert(summary.merchantAccuracy === 100, "100% merchant accuracy");
 
 // -----------------------------------------------------------
@@ -328,6 +328,8 @@ assert(csv.includes("expected_type,expected_is_bill,predicted_is_bill"), "CSV in
 assert(csv.includes("overall_status,action_status"), "CSV includes overall_status and action_status");
 assert(csv.includes("Not applicable"), "CSV contains Not applicable for non-bill extractions");
 assert(!csv.includes("pending"), "CSV does not contain 'pending' anywhere");
+assert(!csv.includes("Awaiting ground truth"), "CSV does not contain 'Awaiting ground truth'");
+assert(!csv.includes("Missing ground truth"), "CSV does not contain 'Missing ground truth'");
 
 console.log("\n=================================================");
 console.log(`ALL TESTS PASSED! (${passedTests}/${totalTests} checks passed)`);
