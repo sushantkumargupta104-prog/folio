@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Camera, Images } from "lucide-react";
+import { Camera, Images, ClipboardCheck } from "lucide-react";
 import { EmptyState } from "@/components/dashboard/empty-state";
 import { BillRow } from "@/components/bills/bill-row";
 import { AppShell } from "@/components/layout/app-shell";
@@ -58,6 +58,18 @@ export function DashboardView() {
           <Images size={18} strokeWidth={1.8} />
           Upload from gallery
         </ButtonLink>
+      </div>
+
+      <div className="mt-4">
+        <Link
+          href="/evaluation"
+          className="flex items-center justify-between rounded-lg border border-line bg-paper-2 px-3.5 py-2.5 text-xs text-ink-soft hover:text-ink hover:border-accent/40 transition-colors"
+        >
+          <span className="flex items-center gap-1.5 font-medium">
+            <ClipboardCheck size={15} className="text-accent" /> Scan Evaluation & History
+          </span>
+          <span className="text-accent">View all attempts →</span>
+        </Link>
       </div>
 
       <section className="mt-10" aria-labelledby="recent-heading">

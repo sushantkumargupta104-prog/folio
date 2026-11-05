@@ -10,19 +10,22 @@ interface AmountCandidate {
   raw: string;
   weight: number;
   label: string;
+  lineIndex: number;
 }
 
 const FINAL_LABELS: Array<{ pattern: RegExp; weight: number; label: string }> = [
-  { pattern: /grand\s*total|g\.?\s*total/, weight: 12, label: "grand total" },
-  { pattern: /amount\s*payable|amt\.?\s*payable/, weight: 11, label: "amount payable" },
-  { pattern: /total\s*due|balance\s*due|amount\s*due/, weight: 10, label: "total due" },
-  { pattern: /net\s*amount|net\s*total|net\s*payable/, weight: 9, label: "net amount" },
-  { pattern: /bill\s*amount|invoice\s*total/, weight: 8, label: "bill amount" },
-  { pattern: /\btotal\b/, weight: 6, label: "total" },
+  { pattern: /\b(grand\s*total|g\.?\s*total)\b/i, weight: 14, label: "grand total" },
+  { pattern: /\b(amount\s*payable|amt\.?\s*payable|net\s*payable)\b/i, weight: 13, label: "amount payable" },
+  { pattern: /\b(total\s*due|balance\s*due|amount\s*due)\b/i, weight: 12, label: "total due" },
+  { pattern: /\b(net\s*amount|net\s*total)\b/i, weight: 11, label: "net amount" },
+  { pattern: /\b(bill\s*amount|total\s*amount|invoice\s*total)\b/i, weight: 10, label: "bill amount" },
+  { pattern: /\b(total|tot\b)\b/i, weight: 7, label: "total" },
 ];
 
 const AVOID_LABELS =
-  /\b(sub\s*total|subtotal|taxable|cgst|sgst|igst|gst|vat|tax|discount|less|cash|tender(?:ed)?|change|round\s*off|qty|quantity|rate|mrp)\b/i;
+  /\b(sub\s*total|subtotal|taxable|cgst|sgst|igst|gst|vat|tax|discount|less|cash|tender(?:ed)?|change\s*return|balance\s*return|round\s*off|qty|quantity|rate|mrp|items?)\b/i;
+
+const DATE_LINE_PATTERN = /\bdate\b|\b\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}\b/i;
 
 const MONEY_PATTERN =
   /(?:₹|rs\.?|inr)?\s*([0-9]{1,3}(?:,[0-9]{2,3})+|[0-9]+)(?:\.([0-9]{1,2}))?/gi;
@@ -37,44 +40,65 @@ export function extractAmount(ocr: OcrResult | string): ExtractedField<number> {
 
   const candidates: AmountCandidate[] = [];
 
-  for (const line of lines) {
-    const money = [...line.matchAll(MONEY_PATTERN)]
-      .map((match) => parseMoney(match[0]))
-      .filter((value): value is number => value !== null);
+  lines.forEach((line, lineIndex) => {
+    // If the line is purely a date line, do not extract year numbers as amounts
+    const isDateLine = DATE_LINE_PATTERN.test(line) && !/total|amount|payable/i.test(line);
 
-    if (money.length === 0) continue;
+    const moneyValues = extractMoneyFromLine(line);
+    if (moneyValues.length === 0) return;
 
     const avoided = AVOID_LABELS.test(line);
-    const labeled = FINAL_LABELS.find((item) => item.pattern.test(line.toLowerCase()));
-    const amount = money[money.length - 1];
+    const matchedLabel = FINAL_LABELS.find((item) => item.pattern.test(line));
+    const amount = moneyValues[moneyValues.length - 1];
 
-    if (labeled && !avoided) {
-      candidates.push({
-        amount,
-        raw: line,
-        weight: labeled.weight,
-        label: labeled.label,
-      });
-      continue;
+    if (isDateLine && (amount >= 1990 && amount <= 2040)) {
+      // Discard year numbers misread as amounts
+      return;
     }
 
-    if (!avoided && /₹|rs\.?|inr/i.test(line) && amount >= 10) {
+    if (matchedLabel && !avoided) {
       candidates.push({
         amount,
         raw: line,
-        weight: 2,
+        weight: matchedLabel.weight,
+        label: matchedLabel.label,
+        lineIndex,
+      });
+      return;
+    }
+
+    // Currency symbol match on a non-avoided line
+    if (!avoided && !isDateLine && /(?:₹|rs\.?|inr)/i.test(line) && amount >= 1) {
+      candidates.push({
+        amount,
+        raw: line,
+        weight: 3,
         label: "currency amount",
+        lineIndex,
       });
     }
-  }
+  });
 
   if (candidates.length === 0) {
-    const fallback = [...text.matchAll(MONEY_PATTERN)]
-      .map((match) => parseMoney(match[0]))
-      .filter((value): value is number => value !== null)
-      .sort((a, b) => b - a)[0];
+    // Fallback: search all money patterns in lines, skipping obvious date lines and subtotal/tax lines
+    const fallbacks: AmountCandidate[] = [];
+    lines.forEach((line, lineIndex) => {
+      if (DATE_LINE_PATTERN.test(line) && !/total|amount/i.test(line)) return;
+      if (AVOID_LABELS.test(line)) return;
+      const values = extractMoneyFromLine(line);
+      for (const val of values) {
+        if (val >= 1990 && val <= 2040 && line.toLowerCase().includes("date")) continue;
+        fallbacks.push({
+          amount: val,
+          raw: line,
+          weight: 1,
+          label: "fallback amount",
+          lineIndex,
+        });
+      }
+    });
 
-    if (!fallback) {
+    if (fallbacks.length === 0) {
       return {
         value: null,
         ...resolveExtractionReview({
@@ -86,32 +110,41 @@ export function extractAmount(ocr: OcrResult | string): ExtractedField<number> {
       };
     }
 
+    // Sort by line position (totals usually appear towards bottom) and amount
+    fallbacks.sort((a, b) => b.lineIndex - a.lineIndex || b.amount - a.amount);
+    const bestFallback = fallbacks[0];
+
     const review = resolveExtractionReview({
       hasValue: true,
       extractionReliable: false,
       ambiguous: true,
-      ocrWordConfidence: snippetOcrConfidence(words, String(fallback)),
+      ocrWordConfidence: snippetOcrConfidence(words, String(bestFallback.amount)),
     });
 
     return {
-      value: fallback,
+      value: bestFallback.amount,
       ...review,
       warning: "Please verify this amount",
-      raw: String(fallback),
+      raw: bestFallback.raw,
     };
   }
 
-  candidates.sort((a, b) => b.weight - a.weight || b.amount - a.amount);
+  // Sort candidates:
+  // Primary: highest weight (e.g. Grand Total > Total > Currency)
+  // Secondary: later in document (totals appear near bottom)
+  candidates.sort((a, b) => b.weight - a.weight || b.lineIndex - a.lineIndex);
   const best = candidates[0];
+
   const competingAmounts = new Set(
     candidates
       .filter(
         (candidate) =>
           candidate.amount !== best.amount &&
-          candidate.weight >= Math.max(2, best.weight - 3),
+          candidate.weight >= Math.max(3, best.weight - 2),
       )
       .map((candidate) => candidate.amount),
   );
+
   const labeledFinal = best.weight >= EXTRACTION_THRESHOLDS.amountLabeledMinWeight;
   const ambiguous = competingAmounts.size > 0 || !labeledFinal;
   const review = resolveExtractionReview({
@@ -134,19 +167,31 @@ export function extractAmount(ocr: OcrResult | string): ExtractedField<number> {
   };
 }
 
+function extractMoneyFromLine(line: string): number[] {
+  const matches = [...line.matchAll(MONEY_PATTERN)];
+  const results: number[] = [];
+  for (const m of matches) {
+    const val = parseMoney(m[0]);
+    if (val !== null) results.push(val);
+  }
+  return results;
+}
+
 export function parseMoney(raw: string): number | null {
   const cleaned = sanitizeAmountInput(raw).replace(/,/g, "");
   if (!/^\d+(\.\d{1,2})?$/.test(cleaned)) return null;
   const amount = Number(cleaned);
-  if (!Number.isFinite(amount) || amount <= 0 || amount > 10_000_000) return null;
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 100_000_000) return null;
   return amount;
 }
 
 export function sanitizeAmountInput(raw: string): string {
   return raw
     .replace(/₹/g, "")
-    .replace(/\b(rs\.?|inr)\b/gi, "")
-    .replace(/[^\d.,]/g, "");
+    .replace(/(?:^|\b)(?:rs\.?|inr)\s*/gi, "")
+    .replace(/[^\d.,]/g, "")
+    .replace(/^\.+/, "") // remove leading dots (e.g. from ".451.50")
+    .replace(/\.+$/, ""); // remove trailing dots
 }
 
 export function amountToInputValue(amount: number): string {

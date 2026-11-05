@@ -7,16 +7,28 @@ import { Button } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
 import { useObjectUrl } from "@/hooks/use-object-url";
 import { saveDraft } from "@/lib/db/draft-service";
+import {
+  createScanAttempt,
+  markAttemptCancelled,
+} from "@/lib/db/evaluation-service";
 import { processBillImage } from "@/lib/scan/process-bill";
 import { validateImageFile } from "@/lib/validation/image-file";
+import type { ScanAttempt } from "@/types/evaluation";
 import { toUserMessage } from "@/utils/errors";
 
 type ScanState =
   | { step: "pick" }
   | { step: "preview"; file: File }
-  | { step: "processing"; file: File; label: string; progress?: number }
-  | { step: "not-bill"; file: File }
-  | { step: "uncertain"; file: File };
+  | {
+      step: "processing";
+      file: File;
+      label: string;
+      progress?: number;
+      attemptId: string;
+    }
+  | { step: "ocr-failed"; file: File; attemptId: string; message: string }
+  | { step: "not-bill"; file: File; attemptId: string }
+  | { step: "uncertain"; file: File; attemptId: string };
 
 export function ScanView() {
   const router = useRouter();
@@ -56,17 +68,36 @@ export function ScanView() {
     if (state.step !== "preview" && state.step !== "uncertain") return;
     const file = state.file;
     setError(null);
-    setState({ step: "processing", file, label: "Preparing your image" });
+
+    // Create persistent Scan Attempt record immediately as processing begins
+    let attempt: ScanAttempt;
     try {
-      const result = await processBillImage(file, (label, progress) => {
-        setState({ step: "processing", file, label, progress });
+      attempt = await createScanAttempt({
+        imageFile: file,
+        imageFileName: file.name,
+      });
+    } catch (recordError) {
+      console.error("Failed to create scan record:", recordError);
+      setError("Could not initialize scan attempt recording.");
+      return;
+    }
+
+    setState({
+      step: "processing",
+      file,
+      label: "Preparing your image...",
+      attemptId: attempt.id,
+    });
+
+    try {
+      const result = await processBillImage(file, {
+        attemptId: attempt.id,
+        onStatus: (label, progress) => {
+          setState({ step: "processing", file, label, progress, attemptId: attempt.id });
+        },
       });
 
-      if (result.detection.decision === "not_bill") {
-        setState({ step: "not-bill", file });
-        return;
-      }
-
+      // Save draft with the attemptId so review & save can link them
       await saveDraft({
         imageBlob: file,
         originalOcrText: result.ocr.text,
@@ -74,26 +105,87 @@ export function ScanView() {
         detection: result.detection,
         extraction: result.extraction,
         createdAt: new Date().toISOString(),
+        scanAttemptId: attempt.id,
       });
 
+      if (result.detection.decision === "not_bill") {
+        setState({ step: "not-bill", file, attemptId: attempt.id });
+        return;
+      }
+
       if (result.detection.decision === "uncertain") {
-        setState({ step: "uncertain", file });
+        setState({ step: "uncertain", file, attemptId: attempt.id });
         return;
       }
 
       router.push("/review");
     } catch (processError) {
-      setError(
-        toUserMessage(
-          processError,
-          "Folio could not read this image. Try another photo with the bill filling the frame.",
-        ),
+      const msg = toUserMessage(
+        processError,
+        "We couldn't read enough text from this image. Try a clearer, well-lit photo or enter the details manually.",
       );
-      setState({ step: "preview", file });
+      setState({ step: "ocr-failed", file, attemptId: attempt.id, message: msg });
     }
   }
 
+  async function onManualEntryFromFailure() {
+    if (state.step !== "ocr-failed" && state.step !== "not-bill") return;
+    const { file, attemptId } = state;
+
+    // Create an empty draft allowing manual review
+    await saveDraft({
+      imageBlob: file,
+      originalOcrText: "",
+      meanOcrConfidence: 0,
+      detection: {
+        isBill: true,
+        confidence: 0.5,
+        score: 0,
+        reasons: ["Manual entry initiated by user"],
+        warnings: ["OCR failed or skipped"],
+        decision: "uncertain",
+      },
+      extraction: {
+        merchantName: {
+          value: null,
+          confidence: 0,
+          ocrConfidence: null,
+          reliability: "not_detected",
+          status: "missing",
+        },
+        date: {
+          value: null,
+          confidence: 0,
+          ocrConfidence: null,
+          reliability: "not_detected",
+          status: "missing",
+        },
+        totalAmount: {
+          value: null,
+          confidence: 0,
+          ocrConfidence: null,
+          reliability: "not_detected",
+          status: "missing",
+        },
+        category: {
+          value: "Other",
+          confidence: 0,
+          ocrConfidence: null,
+          reliability: "not_detected",
+          status: "needs_review",
+        },
+      },
+      createdAt: new Date().toISOString(),
+      scanAttemptId: attemptId,
+    });
+
+    router.push("/review");
+  }
+
   function resetToPick() {
+    if ("attemptId" in state && state.attemptId) {
+      void markAttemptCancelled(state.attemptId);
+    }
     setError(null);
     setState({ step: "pick" });
   }
@@ -156,7 +248,11 @@ export function ScanView() {
           {previewUrl ? (
             <div className="mt-5 overflow-hidden rounded-[10px] border border-line bg-paper-2">
               {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={previewUrl} alt="Selected bill preview" className="mx-auto max-h-[52vh] object-contain" />
+              <img
+                src={previewUrl}
+                alt="Selected bill preview"
+                className="mx-auto max-h-[52vh] object-contain"
+              />
             </div>
           ) : null}
           {error ? (
@@ -196,19 +292,56 @@ export function ScanView() {
             </div>
           )}
           <p className="mt-5 text-sm text-ink-muted">
-            The first scan may download recognition data. Folio does not send your photo to a server.
+            The first scan may download recognition data. Folio never sends your photo to a server.
           </p>
         </div>
+      ) : null}
+
+      {state.step === "ocr-failed" ? (
+        <>
+          <h1 className="font-serif text-[32px] leading-tight text-ink">Could not read text</h1>
+          <p className="mt-2 text-[15px] leading-6 text-ink-soft">
+            {state.message}
+          </p>
+          {previewUrl ? (
+            <div className="mt-5 overflow-hidden rounded-[10px] border border-line bg-paper-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={previewUrl}
+                alt="Selected bill preview"
+                className="mx-auto max-h-[40vh] object-contain"
+              />
+            </div>
+          ) : null}
+          <div className="mt-6 space-y-3">
+            <Button onClick={() => void onManualEntryFromFailure()}>
+              Enter details manually
+            </Button>
+            <Button variant="secondary" onClick={resetToPick}>
+              Try another image
+            </Button>
+          </div>
+        </>
       ) : null}
 
       {state.step === "not-bill" ? (
         <>
           <h1 className="font-serif text-[32px] leading-tight text-ink">
-            This doesn&apos;t appear to be a bill.
+            This doesn&apos;t appear to be a bill
           </h1>
           <p className="mt-2 text-[15px] leading-6 text-ink-soft">
-            Please upload a receipt, invoice or purchase bill.
+            We checked the image and couldn&apos;t detect receipt or invoice information. Non-bills are recorded in your scan evaluations and not saved to your expenses.
           </p>
+          {previewUrl ? (
+            <div className="mt-5 overflow-hidden rounded-[10px] border border-line bg-paper-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={previewUrl}
+                alt="Selected bill preview"
+                className="mx-auto max-h-[40vh] object-contain"
+              />
+            </div>
+          ) : null}
           <div className="mt-7 space-y-3">
             <Button onClick={resetToPick}>Try another image</Button>
             <Button variant="secondary" onClick={() => router.push("/")}>
@@ -220,10 +353,20 @@ export function ScanView() {
 
       {state.step === "uncertain" ? (
         <>
-          <h1 className="font-serif text-[32px] leading-tight text-ink">We could not be sure</h1>
+          <h1 className="font-serif text-[32px] leading-tight text-ink">We&apos;re not sure this is a bill</h1>
           <p className="mt-2 text-[15px] leading-6 text-ink-soft">
-            This image might be a bill, but the details look incomplete. You can review them or try another photo.
+            This image might be a bill, but the details look incomplete or blurry. You can retry with a clearer image or continue to review.
           </p>
+          {previewUrl ? (
+            <div className="mt-5 overflow-hidden rounded-[10px] border border-line bg-paper-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={previewUrl}
+                alt="Selected bill preview"
+                className="mx-auto max-h-[40vh] object-contain"
+              />
+            </div>
+          ) : null}
           <div className="mt-7 space-y-3">
             <Button onClick={() => router.push("/review")}>Review details anyway</Button>
             <Button variant="secondary" onClick={resetToPick}>

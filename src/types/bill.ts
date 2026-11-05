@@ -77,6 +77,7 @@ export interface Bill {
   detectionConfidence: number;
   fieldReviewStatus: FieldReviewMap;
   originalExtraction?: OriginalExtraction;
+  scanAttemptId?: string;
 }
 
 export interface BillInput {
@@ -89,11 +90,18 @@ export interface BillInput {
   detectionConfidence: number;
   fieldReviewStatus: FieldReviewMap;
   originalExtraction?: OriginalExtraction;
+  scanAttemptId?: string;
 }
 
 export interface OcrWord {
   text: string;
   confidence: number;
+  bbox?: {
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  };
 }
 
 export interface OcrResult {
@@ -110,6 +118,7 @@ export interface ScanDraft {
   detection: BillDetectionResult;
   extraction: ExtractionResult;
   createdAt: string;
+  scanAttemptId?: string;
 }
 
 export type BillSortKey = "date-desc" | "date-asc" | "amount-desc" | "amount-asc";

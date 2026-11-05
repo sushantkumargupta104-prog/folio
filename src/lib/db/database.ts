@@ -1,15 +1,23 @@
 import Dexie, { type EntityTable } from "dexie";
 import type { Bill, ScanDraft } from "@/types/bill";
+import type { ScanAttempt } from "@/types/evaluation";
 
 class FolioDatabase extends Dexie {
   bills!: EntityTable<Bill, "id">;
   drafts!: EntityTable<ScanDraft, "id">;
+  scanAttempts!: EntityTable<ScanAttempt, "id">;
 
   constructor() {
     super("folio-db");
     this.version(1).stores({
       bills: "id, date, merchantName, category, createdAt, totalAmount",
       drafts: "id",
+    });
+    this.version(2).stores({
+      bills: "id, date, merchantName, category, createdAt, totalAmount",
+      drafts: "id",
+      scanAttempts:
+        "id, imageId, createdAt, processingStatus, predictedIsBill, failureStage, isSavedAsBill, imageFileName, datasetTag",
     });
   }
 }

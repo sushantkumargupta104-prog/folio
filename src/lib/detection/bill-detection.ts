@@ -15,19 +15,22 @@ export function detectBill(ocr: OcrResult): BillDetectionResult {
   const warnings: string[] = [];
   let score = 0;
 
-  if (compact.length < 20 || ocr.words.length < 6) {
+  // Text density check
+  if (compact.length < 15 || ocr.words.length < 4) {
     score -= 4;
     warnings.push("Very little readable text was found");
-  } else if (compact.length > 40) {
+  } else if (compact.length >= 35) {
     score += 1;
     reasons.push("The image contains a useful amount of text");
   }
 
+  // OCR confidence influence
   if (ocr.meanConfidence > 0 && ocr.meanConfidence < 40) {
     score -= 1;
-    warnings.push("The text is hard to read, so detection is less certain");
+    warnings.push("The text is faint or blurry, reducing detection certainty");
   }
 
+  // Positive pattern scoring
   for (const rule of POSITIVE_PATTERNS) {
     if (rule.pattern.test(text)) {
       score += rule.weight;
@@ -35,45 +38,55 @@ export function detectBill(ocr: OcrResult): BillDetectionResult {
     }
   }
 
+  // Date hint
   if (DATE_HINT.test(text)) {
     score += 2;
-    reasons.push("Found a date");
+    reasons.push("Found a calendar date");
   }
 
+  // Money / currency hints
   if (MONEY_HINT.test(text)) {
     score += 2;
-    reasons.push("Found currency-style amounts");
+    reasons.push("Found monetary values");
   }
 
-  const moneyHits = text.match(/(?:₹|rs\.?)\s*\d|(?:\d{1,3}(?:,\d{2,3})+(?:\.\d{2})?)/gi) ?? [];
-  if (moneyHits.length >= 2) {
+  // Multiple money values check (line items + total)
+  const moneyMatches =
+    text.match(/(?:₹|rs\.?|inr)\s*\d+(?:\.\d{2})?|\b\d{1,3}(?:,\d{2,3})*(?:\.\d{2})\b/gi) ?? [];
+  if (moneyMatches.length >= 2) {
     score += 1;
-    reasons.push("Found more than one monetary value");
+    reasons.push("Found multiple pricing entries");
   }
 
+  // Negative pattern scoring
+  let hasHardNegative = false;
   for (const rule of NEGATIVE_PATTERNS) {
     if (rule.pattern.test(text)) {
       score -= rule.weight;
       warnings.push(rule.reason);
+      hasHardNegative = true;
     }
   }
 
+  // Alphabet vs symbol ratio
   const alphaRatio = alphaCharacterRatio(compact);
   if (compact.length > 0 && alphaRatio < 0.15) {
     score -= 3;
-    warnings.push("The image does not contain much readable language");
+    warnings.push("Text lacks standard linguistic structure");
   }
 
   let decision: BillDetectionResult["decision"];
-  if (score >= BILL_ACCEPT_THRESHOLD && !hasBlockingNegative(warnings)) {
+  if (hasHardNegative) {
+    decision = "not_bill";
+  } else if (score >= BILL_ACCEPT_THRESHOLD) {
     decision = "bill";
-  } else if (score <= BILL_UNCERTAIN_THRESHOLD || hasBlockingNegative(warnings)) {
+  } else if (score <= BILL_UNCERTAIN_THRESHOLD) {
     decision = "not_bill";
   } else {
     decision = "uncertain";
   }
 
-  const confidence = clamp((score + 6) / 16, 0, 1);
+  const confidence = clamp((score + 4) / 16, 0, 1);
 
   return {
     isBill: decision === "bill",
@@ -83,15 +96,6 @@ export function detectBill(ocr: OcrResult): BillDetectionResult {
     warnings,
     decision,
   };
-}
-
-function hasBlockingNegative(warnings: string[]): boolean {
-  return warnings.some(
-    (warning) =>
-      warning.includes("identity") ||
-      warning.includes("passport") ||
-      warning.includes("social media"),
-  );
 }
 
 function alphaCharacterRatio(text: string): number {

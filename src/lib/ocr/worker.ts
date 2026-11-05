@@ -16,42 +16,75 @@ export async function getOcrWorker(): Promise<Worker> {
   }
 
   if (!workerPromise) {
-    workerPromise = createReusableWorker();
+    workerPromise = createReusableWorker().catch((err) => {
+      workerPromise = null;
+      throw err;
+    });
   }
 
   return workerPromise;
 }
 
+export function resetOcrWorker(): void {
+  if (workerPromise) {
+    workerPromise
+      .then((worker) => worker.terminate())
+      .catch(() => {
+        /* ignore termination error */
+      });
+    workerPromise = null;
+  }
+}
+
 async function createReusableWorker(): Promise<Worker> {
   try {
     const { createWorker } = await import("tesseract.js");
-    return await createWorker("eng", 1, {
+    const worker = await createWorker("eng", 1, {
       logger: (message) => {
         progressHandler?.(message.status, message.progress);
       },
     });
-  } catch {
+
+    try {
+      // PSM 3 (fully automatic) with preserved interword spaces for receipts
+      await worker.setParameters({
+        preserve_interword_spaces: "1",
+      });
+    } catch {
+      // parameter setting fallback
+    }
+
+    return worker;
+  } catch (error) {
     workerPromise = null;
+    console.error("Failed to start Tesseract worker:", error);
     throw new AppError(
       "Folio could not start text recognition. Check your connection and try again. The first scan may need to download recognition data.",
     );
   }
 }
 
-export function describeOcrStatus(status: string, progress?: number): {
+export function describeOcrStatus(
+  status: string,
+  progress?: number,
+): {
   label: string;
   progress?: number;
 } {
   if (status === "recognizing text") {
     return {
-      label: "Reading your bill",
+      label: "Reading text from your bill...",
       progress: typeof progress === "number" ? progress : undefined,
     };
   }
-  if (status.includes("loading language") || status.includes("initializing api") || status.includes("loaded language")) {
+  if (
+    status.includes("loading") ||
+    status.includes("initializing") ||
+    status.includes("loaded")
+  ) {
     return {
-      label: "Preparing the reader. This may download recognition data the first time.",
+      label: "Preparing OCR engine. (Downloading models on initial scan...)",
     };
   }
-  return { label: "Reading your bill" };
+  return { label: "Processing image..." };
 }

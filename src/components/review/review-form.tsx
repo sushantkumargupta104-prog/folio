@@ -10,6 +10,7 @@ import { Notice } from "@/components/ui/notice";
 import { useObjectUrl } from "@/hooks/use-object-url";
 import { addBill } from "@/lib/db/bill-service";
 import { clearDraft } from "@/lib/db/draft-service";
+import { linkScanAttemptToSavedBill } from "@/lib/db/evaluation-service";
 import { amountToInputValue, parseMoney, sanitizeAmountInput } from "@/lib/extraction/amount-extractor";
 import { statusAfterUserEdit } from "@/lib/extraction/confidence";
 import {
@@ -63,6 +64,14 @@ export function ReviewForm({ draft }: { draft: ScanDraft }) {
     };
   }, [category, date, extraction, merchantName, totalAmount]);
 
+  const hasUncertainFields =
+    extraction.merchantName.status === "needs_review" ||
+    extraction.merchantName.status === "missing" ||
+    extraction.date.status === "needs_review" ||
+    extraction.date.status === "missing" ||
+    extraction.totalAmount.status === "needs_review" ||
+    extraction.totalAmount.status === "missing";
+
   async function onSave() {
     const nextErrors = validateBillForm({
       merchantName,
@@ -91,7 +100,13 @@ export function ReviewForm({ draft }: { draft: ScanDraft }) {
           totalAmount: extraction.totalAmount.value,
           category: extraction.category.value,
         },
+        scanAttemptId: draft.scanAttemptId,
       });
+
+      if (draft.scanAttemptId) {
+        await linkScanAttemptToSavedBill(draft.scanAttemptId, bill.id);
+      }
+
       await clearDraft();
       router.replace(`/bills/${bill.id}?saved=1`);
     } catch (error) {
@@ -114,8 +129,14 @@ export function ReviewForm({ draft }: { draft: ScanDraft }) {
 
       {draft.detection.decision === "uncertain" ? (
         <div className="mt-5">
-          <Notice tone="warn" title="This may not be a complete bill">
-            Please check every field carefully before saving.
+          <Notice tone="warn" title="We're not sure this is a bill">
+            You can retry with a clearer image or continue to review and check every field before saving.
+          </Notice>
+        </div>
+      ) : hasUncertainFields ? (
+        <div className="mt-5">
+          <Notice tone="warn" title="Some details need your attention">
+            We detected a bill, but some fields were blurry, handwritten or uncertain. Please verify them below.
           </Notice>
         </div>
       ) : null}
