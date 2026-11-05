@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { Download, Filter, Trash2, RefreshCw, Eye } from "lucide-react";
+import { Download, Filter, Trash2, RefreshCw, Eye, Wrench } from "lucide-react";
 import { AppShell } from "@/components/layout/app-shell";
 import { Button } from "@/components/ui/button";
 import { Notice } from "@/components/ui/notice";
@@ -9,11 +9,17 @@ import { AttemptDetailModal } from "@/components/evaluation/attempt-detail-modal
 import { DatasetRunner } from "@/components/evaluation/dataset-runner";
 import { useEvaluation } from "@/hooks/use-evaluation";
 import {
-  calculateEvaluation,
   calculateEvaluationSummary,
+  evaluateScanAttempt,
   exportEvaluationCsv,
 } from "@/lib/db/evaluation-service";
-import type { ComparisonResult, ScanAttempt } from "@/types/evaluation";
+import type {
+  ClassificationStatus,
+  ExpectedTypeStatus,
+  ExtractionStatus,
+  OverallStatus,
+  ScanAttempt,
+} from "@/types/evaluation";
 import { formatSavedAt } from "@/utils/format";
 
 type FilterType =
@@ -23,7 +29,8 @@ type FilterType =
   | "genuine_bills"
   | "non_bills"
   | "ocr_failures"
-  | "extraction_failures";
+  | "extraction_failures"
+  | "awaiting_ground_truth";
 
 export function EvaluationView() {
   const {
@@ -31,14 +38,20 @@ export function EvaluationView() {
     loading,
     error,
     refresh,
+    repair,
     updateGroundTruth,
     removeAttempt,
     clearAll,
   } = useEvaluation();
 
   const [filter, setFilter] = useState<FilterType>("all");
-  const [selectedAttempt, setSelectedAttempt] = useState<ScanAttempt | null>(null);
+  const [selectedAttemptState, setSelectedAttemptState] = useState<{
+    attempt: ScanAttempt;
+    initialEditGt?: boolean;
+  } | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [repairMsg, setRepairMsg] = useState<string | null>(null);
+  const [repairing, setRepairing] = useState(false);
 
   // Compute summary metrics with honest denominators
   const summary = useMemo(() => calculateEvaluationSummary(attempts), [attempts]);
@@ -46,12 +59,12 @@ export function EvaluationView() {
   // Filter attempts
   const filteredAttempts = useMemo(() => {
     return attempts.filter((attempt) => {
-      const evaluation = calculateEvaluation(attempt);
+      const evaluation = evaluateScanAttempt(attempt);
       switch (filter) {
         case "correct_classification":
-          return evaluation.classification === "correct";
+          return evaluation.classification === "Correct";
         case "incorrect_classification":
-          return evaluation.classification === "incorrect";
+          return evaluation.classification === "Incorrect";
         case "genuine_bills":
           return (
             attempt.expectedIsBill === true ||
@@ -66,11 +79,19 @@ export function EvaluationView() {
           return attempt.ocrStatus === "failed" || attempt.failureStage === "ocr";
         case "extraction_failures":
           return (
-            evaluation.merchant === "incorrect" ||
-            evaluation.date === "incorrect" ||
-            evaluation.amount === "incorrect" ||
-            evaluation.category === "incorrect" ||
-            attempt.failureStage === "extraction"
+            evaluation.merchant === "Incorrect" ||
+            evaluation.merchant === "Not extracted" ||
+            evaluation.date === "Incorrect" ||
+            evaluation.date === "Not extracted" ||
+            evaluation.amount === "Incorrect" ||
+            evaluation.amount === "Not extracted" ||
+            evaluation.category === "Incorrect" ||
+            evaluation.category === "Not extracted"
+          );
+        case "awaiting_ground_truth":
+          return (
+            evaluation.expectedType === "Missing ground truth" ||
+            evaluation.overall === "Awaiting ground truth"
           );
         case "all":
         default:
@@ -93,6 +114,19 @@ export function EvaluationView() {
     URL.revokeObjectURL(url);
   }
 
+  async function handleRepair() {
+    setRepairing(true);
+    setRepairMsg(null);
+    try {
+      await repair();
+      setRepairMsg("All scan attempt evaluations have been recalculated and repaired.");
+    } catch {
+      setRepairMsg("Could not complete recalculation.");
+    } finally {
+      setRepairing(false);
+    }
+  }
+
   return (
     <AppShell title="Scan Evaluation" backHref="/">
       <div className="flex flex-col sm:flex-row sm:items-baseline justify-between gap-4 border-b border-line pb-4">
@@ -105,7 +139,16 @@ export function EvaluationView() {
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            variant="secondary"
+            onClick={() => void handleRepair()}
+            disabled={repairing || loading}
+            title="Recalculate evaluation statuses for all records"
+          >
+            <Wrench size={15} /> {repairing ? "Recalculating..." : "Recalculate & Repair"}
+          </Button>
+
           <Button
             variant="secondary"
             onClick={handleExportCsv}
@@ -113,11 +156,18 @@ export function EvaluationView() {
           >
             <Download size={16} /> Export CSV
           </Button>
+
           <Button variant="ghost" onClick={() => void refresh()}>
             <RefreshCw size={16} />
           </Button>
         </div>
       </div>
+
+      {repairMsg ? (
+        <div className="mt-4">
+          <Notice tone="ok">{repairMsg}</Notice>
+        </div>
+      ) : null}
 
       {error ? (
         <div className="mt-5">
@@ -269,6 +319,7 @@ export function EvaluationView() {
             { id: "non_bills", label: "Non-Bills" },
             { id: "ocr_failures", label: "OCR Failures" },
             { id: "extraction_failures", label: "Extraction Failures" },
+            { id: "awaiting_ground_truth", label: "Awaiting Ground Truth" },
           ].map((tab) => (
             <button
               key={tab.id}
@@ -315,11 +366,17 @@ export function EvaluationView() {
               </thead>
               <tbody className="divide-y divide-line">
                 {filteredAttempts.map((attempt) => {
-                  const evalResult = calculateEvaluation(attempt);
+                  const evalResult = evaluateScanAttempt(attempt);
                   return (
                     <tr
                       key={attempt.id}
-                      onClick={() => setSelectedAttempt(attempt)}
+                      onClick={() =>
+                        setSelectedAttemptState({
+                          attempt,
+                          initialEditGt:
+                            evalResult.expectedType === "Missing ground truth",
+                        })
+                      }
                       className="hover:bg-paper-2/50 cursor-pointer transition-colors"
                     >
                       <td className="py-3 px-3">
@@ -331,14 +388,8 @@ export function EvaluationView() {
                         </div>
                       </td>
 
-                      <td className="py-3 px-3 text-ink-soft">
-                        {attempt.expectedIsBill === null ? (
-                          <span className="text-ink-muted italic">Pending</span>
-                        ) : attempt.expectedIsBill ? (
-                          "Bill"
-                        ) : (
-                          "Non-bill"
-                        )}
+                      <td className="py-3 px-3">
+                        <ExpectedBadge status={evalResult.expectedType} />
                       </td>
 
                       <td className="py-3 px-3 text-ink-soft">
@@ -352,49 +403,71 @@ export function EvaluationView() {
                       </td>
 
                       <td className="py-3 px-3">
-                        <Badge result={evalResult.classification} />
+                        <StatusBadge status={evalResult.classification} />
                       </td>
 
                       <td className="py-3 px-3">
-                        <Badge result={evalResult.merchant} />
+                        <StatusBadge status={evalResult.merchant} />
                       </td>
 
                       <td className="py-3 px-3">
-                        <Badge result={evalResult.date} />
+                        <StatusBadge status={evalResult.date} />
                       </td>
 
                       <td className="py-3 px-3">
-                        <Badge result={evalResult.amount} />
+                        <StatusBadge status={evalResult.amount} />
                       </td>
 
                       <td className="py-3 px-3">
-                        <Badge result={evalResult.category} />
+                        <StatusBadge status={evalResult.category} />
                       </td>
 
                       <td className="py-3 px-3 text-center">
-                        <span
-                          className={`inline-block px-2 py-0.5 rounded text-[10px] font-semibold ${
-                            evalResult.overall === "passed"
-                              ? "bg-green-100 text-green-800"
-                              : evalResult.overall === "failed"
-                                ? "bg-red-100 text-red-800"
-                                : "bg-paper-2 text-ink-muted"
-                          }`}
-                        >
-                          {evalResult.overall.toUpperCase()}
-                        </span>
+                        <OverallBadge status={evalResult.overall} />
                       </td>
 
                       <td className="py-3 px-3 text-right">
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setSelectedAttempt(attempt);
-                          }}
-                          className="inline-flex items-center gap-1 text-xs text-accent hover:underline font-medium"
-                        >
-                          <Eye size={13} /> View
-                        </button>
+                        {evalResult.action === "Review missing ground truth" ? (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedAttemptState({
+                                attempt,
+                                initialEditGt: true,
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs bg-accent/10 text-accent hover:bg-accent/20 font-medium transition-colors"
+                            title="Add expected ground-truth values to evaluate this scan"
+                          >
+                            Review GT
+                          </button>
+                        ) : evalResult.action === "Retry scan" ? (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedAttemptState({
+                                attempt,
+                                initialEditGt: false,
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs bg-red-100 text-red-800 hover:bg-red-200 font-medium transition-colors"
+                          >
+                            Retry
+                          </button>
+                        ) : (
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedAttemptState({
+                                attempt,
+                                initialEditGt: false,
+                              });
+                            }}
+                            className="inline-flex items-center gap-1 text-xs text-accent hover:underline font-medium"
+                          >
+                            <Eye size={13} /> View
+                          </button>
+                        )}
                       </td>
                     </tr>
                   );
@@ -406,19 +479,24 @@ export function EvaluationView() {
       </section>
 
       {/* DETAIL MODAL */}
-      {selectedAttempt ? (
+      {selectedAttemptState ? (
         <AttemptDetailModal
-          attempt={selectedAttempt}
-          onClose={() => setSelectedAttempt(null)}
+          attempt={selectedAttemptState.attempt}
+          initialEditGt={selectedAttemptState.initialEditGt}
+          onClose={() => setSelectedAttemptState(null)}
           onUpdateGroundTruth={async (id, gt) => {
             await updateGroundTruth(id, gt);
-            // Refresh local selectedAttempt reference
             const updated = attempts.find((a) => a.id === id);
-            if (updated) setSelectedAttempt({ ...updated, ...gt });
+            if (updated) {
+              setSelectedAttemptState({
+                attempt: { ...updated, ...gt },
+                initialEditGt: false,
+              });
+            }
           }}
           onDelete={async (id) => {
             await removeAttempt(id);
-            setSelectedAttempt(null);
+            setSelectedAttemptState(null);
           }}
         />
       ) : null}
@@ -426,31 +504,101 @@ export function EvaluationView() {
   );
 }
 
-function Badge({ result }: { result: ComparisonResult }) {
-  switch (result) {
-    case "correct":
+function ExpectedBadge({ status }: { status: ExpectedTypeStatus }) {
+  switch (status) {
+    case "Bill":
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-800">
+          Bill
+        </span>
+      );
+    case "Non-bill":
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-gray-200 text-gray-800">
+          Non-bill
+        </span>
+      );
+    case "Missing ground truth":
+    default:
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
+          Missing ground truth
+        </span>
+      );
+  }
+}
+
+function StatusBadge({
+  status,
+}: {
+  status: ClassificationStatus | ExtractionStatus | string;
+}) {
+  switch (status) {
+    case "Correct":
       return (
         <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-800">
           Correct
         </span>
       );
-    case "incorrect":
+    case "Incorrect":
       return (
         <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-800">
           Incorrect
         </span>
       );
-    case "not_applicable":
+    case "Not extracted":
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] font-medium bg-orange-100 text-orange-800">
+          Not extracted
+        </span>
+      );
+    case "Not applicable":
       return (
         <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-ink-muted bg-paper-2">
           N/A
         </span>
       );
-    case "pending":
+    case "Not evaluated":
+      return (
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-ink-muted bg-paper-2">
+          Not evaluated
+        </span>
+      );
+    case "Awaiting ground truth":
     default:
       return (
-        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-amber-800 bg-amber-50">
-          Pending
+        <span className="inline-block px-1.5 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
+          Awaiting GT
+        </span>
+      );
+  }
+}
+
+function OverallBadge({ status }: { status: OverallStatus }) {
+  switch (status) {
+    case "Correct":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-green-100 text-green-800">
+          CORRECT
+        </span>
+      );
+    case "Partially correct":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-100 text-amber-800">
+          PARTIAL
+        </span>
+      );
+    case "Incorrect":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-red-100 text-red-800">
+          INCORRECT
+        </span>
+      );
+    case "Awaiting ground truth":
+    default:
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[10px] text-amber-900 bg-amber-100/70">
+          AWAITING GT
         </span>
       );
   }

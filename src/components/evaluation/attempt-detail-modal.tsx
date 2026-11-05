@@ -4,17 +4,18 @@ import { useMemo, useState } from "react";
 import { Download, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useObjectUrl } from "@/hooks/use-object-url";
-import { calculateEvaluation } from "@/lib/db/evaluation-service";
+import { evaluateScanAttempt } from "@/lib/db/evaluation-service";
 import {
   EVALUATION_TEST_DATASET,
   type GroundTruthTemplateItem,
 } from "@/lib/evaluation/ground-truth-dataset";
 import { EXPENSE_CATEGORIES, type ExpenseCategory } from "@/types/bill";
-import type { ComparisonResult, EvaluationGroundTruth, ScanAttempt } from "@/types/evaluation";
+import type { EvaluationGroundTruth, ScanAttempt } from "@/types/evaluation";
 import { formatAmount, formatSavedAt } from "@/utils/format";
 
 interface AttemptDetailModalProps {
   attempt: ScanAttempt;
+  initialEditGt?: boolean;
   onClose: () => void;
   onUpdateGroundTruth: (id: string, gt: EvaluationGroundTruth) => Promise<void>;
   onDelete: (id: string) => Promise<void>;
@@ -22,15 +23,16 @@ interface AttemptDetailModalProps {
 
 export function AttemptDetailModal({
   attempt,
+  initialEditGt = false,
   onClose,
   onUpdateGroundTruth,
   onDelete,
 }: AttemptDetailModalProps) {
   const imageUrl = useObjectUrl(attempt.imageBlob);
-  const evaluation = useMemo(() => calculateEvaluation(attempt), [attempt]);
+  const evaluation = useMemo(() => evaluateScanAttempt(attempt), [attempt]);
 
   // Ground truth editor state
-  const [editingGt, setEditingGt] = useState(false);
+  const [editingGt, setEditingGt] = useState(initialEditGt || attempt.expectedIsBill === null);
   const [expectedIsBill, setExpectedIsBill] = useState<string>(
     attempt.expectedIsBill === null ? "" : attempt.expectedIsBill ? "true" : "false",
   );
@@ -152,17 +154,7 @@ export function AttemptDetailModal({
             </div>
             <div className="flex justify-between border-b border-line pb-2">
               <span className="text-ink-muted">Overall Evaluation:</span>
-              <span
-                className={`px-2 py-0.5 rounded text-xs font-semibold ${
-                  evaluation.overall === "passed"
-                    ? "bg-green-100 text-green-800"
-                    : evaluation.overall === "failed"
-                      ? "bg-red-100 text-red-800"
-                      : "bg-paper-2 text-ink-muted"
-                }`}
-              >
-                {evaluation.overall.toUpperCase()}
-              </span>
+              <DetailStatusBadge status={evaluation.overall} />
             </div>
             <div className="flex justify-between border-b border-line pb-2">
               <span className="text-ink-muted">Saved to Expenses:</span>
@@ -234,9 +226,9 @@ export function AttemptDetailModal({
                     value={expectedIsBill}
                     onChange={(e) => setExpectedIsBill(e.target.value)}
                   >
-                    <option value="">(Pending / Not Set)</option>
-                    <option value="true">True (Genuine Bill)</option>
-                    <option value="false">False (Non-Bill)</option>
+                    <option value="">(Missing ground truth)</option>
+                    <option value="true">Bill (Genuine Bill)</option>
+                    <option value="false">Non-bill (Non-Bill Image)</option>
                   </select>
                 </div>
                 <div>
@@ -308,7 +300,7 @@ export function AttemptDetailModal({
               </div>
 
               <div className="flex justify-end gap-2 pt-2">
-                <Button variant="secondary" onClick={onClose}>
+                <Button variant="secondary" onClick={() => setEditingGt(false)}>
                   Cancel
                 </Button>
                 <Button onClick={() => void handleSaveGt()} disabled={savingGt}>
@@ -332,17 +324,11 @@ export function AttemptDetailModal({
                 <tr>
                   <td className="py-2.5 px-3 font-medium">Bill Classification</td>
                   <td className="py-2.5 px-3">
-                    {attempt.expectedIsBill === null ? (
-                      <span className="text-ink-muted">Not provided</span>
-                    ) : attempt.expectedIsBill ? (
-                      "Bill"
-                    ) : (
-                      "Non-bill"
-                    )}
+                    <span className="font-medium">{evaluation.expectedType}</span>
                   </td>
                   <td className="py-2.5 px-3">
                     {attempt.predictedIsBill === null ? (
-                      <span className="text-ink-muted">None</span>
+                      <span className="text-ink-muted">Not evaluated</span>
                     ) : attempt.predictedIsBill ? (
                       `Bill (${Math.round((attempt.billDetectionConfidence ?? 0) * 100)}%)`
                     ) : (
@@ -350,7 +336,7 @@ export function AttemptDetailModal({
                     )}
                   </td>
                   <td className="py-2.5 px-3 text-right">
-                    <ResultBadge result={evaluation.classification} />
+                    <DetailStatusBadge status={evaluation.classification} />
                   </td>
                 </tr>
 
@@ -359,7 +345,7 @@ export function AttemptDetailModal({
                   <td className="py-2.5 px-3">{attempt.expectedMerchant ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3">{attempt.extractedMerchant ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3 text-right">
-                    <ResultBadge result={evaluation.merchant} />
+                    <DetailStatusBadge status={evaluation.merchant} />
                   </td>
                 </tr>
 
@@ -368,7 +354,7 @@ export function AttemptDetailModal({
                   <td className="py-2.5 px-3">{attempt.expectedDate ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3">{attempt.extractedDate ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3 text-right">
-                    <ResultBadge result={evaluation.date} />
+                    <DetailStatusBadge status={evaluation.date} />
                   </td>
                 </tr>
 
@@ -381,7 +367,7 @@ export function AttemptDetailModal({
                     {attempt.extractedAmount != null ? formatAmount(attempt.extractedAmount) : <span className="text-ink-muted">—</span>}
                   </td>
                   <td className="py-2.5 px-3 text-right">
-                    <ResultBadge result={evaluation.amount} />
+                    <DetailStatusBadge status={evaluation.amount} />
                   </td>
                 </tr>
 
@@ -390,7 +376,7 @@ export function AttemptDetailModal({
                   <td className="py-2.5 px-3">{attempt.expectedCategory ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3">{attempt.extractedCategory ?? <span className="text-ink-muted">—</span>}</td>
                   <td className="py-2.5 px-3 text-right">
-                    <ResultBadge result={evaluation.category} />
+                    <DetailStatusBadge status={evaluation.category} />
                   </td>
                 </tr>
               </tbody>
@@ -458,31 +444,54 @@ export function AttemptDetailModal({
   );
 }
 
-function ResultBadge({ result }: { result: ComparisonResult }) {
-  switch (result) {
-    case "correct":
+function DetailStatusBadge({ status }: { status: string }) {
+  switch (status) {
+    case "Correct":
       return (
         <span className="inline-block px-2 py-0.5 rounded text-[11px] font-semibold bg-green-100 text-green-800">
           Correct
         </span>
       );
-    case "incorrect":
+    case "Partially correct":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] font-semibold bg-amber-100 text-amber-800">
+          Partially correct
+        </span>
+      );
+    case "Incorrect":
       return (
         <span className="inline-block px-2 py-0.5 rounded text-[11px] font-semibold bg-red-100 text-red-800">
           Incorrect
         </span>
       );
-    case "not_applicable":
+    case "Not extracted":
       return (
-        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-ink-muted bg-paper-2">
-          N/A
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] font-semibold bg-orange-100 text-orange-800">
+          Not extracted
         </span>
       );
-    case "pending":
+    case "Not applicable":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-ink-muted bg-paper-2">
+          Not applicable
+        </span>
+      );
+    case "Awaiting ground truth":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-amber-900 bg-amber-100/70">
+          Awaiting ground truth
+        </span>
+      );
+    case "Not evaluated":
+      return (
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-ink-muted bg-paper-2">
+          Not evaluated
+        </span>
+      );
     default:
       return (
-        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-amber-800 bg-amber-100">
-          Pending
+        <span className="inline-block px-2 py-0.5 rounded text-[11px] text-ink-muted bg-paper-2">
+          {status}
         </span>
       );
   }

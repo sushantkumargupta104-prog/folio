@@ -20,7 +20,28 @@ export type FailureStage =
 
 export type OcrStatus = "pending" | "success" | "failed" | "skipped";
 
-export type ComparisonResult = "correct" | "incorrect" | "not_applicable" | "pending";
+// Explicit Evaluation Statuses as required
+export type ExpectedTypeStatus = "Bill" | "Non-bill" | "Missing ground truth";
+
+export type ClassificationStatus = "Correct" | "Incorrect" | "Not evaluated";
+
+export type ExtractionStatus =
+  | "Correct"
+  | "Incorrect"
+  | "Not extracted"
+  | "Not applicable"
+  | "Awaiting ground truth";
+
+export type OverallStatus =
+  | "Correct"
+  | "Partially correct"
+  | "Incorrect"
+  | "Awaiting ground truth";
+
+export type ActionStatus =
+  | "View details"
+  | "Review missing ground truth"
+  | "Retry scan";
 
 export interface EvaluationGroundTruth {
   expectedIsBill: boolean | null;
@@ -44,7 +65,7 @@ export interface ScanAttempt {
 
   processingStatus: ProcessingStatus;
 
-  // Bill detection
+  // Bill detection predictions
   predictedIsBill: boolean | null;
   billDetectionConfidence: number | null;
   billDetectionReasons: string[] | null;
@@ -55,7 +76,7 @@ export interface ScanAttempt {
   ocrExtractedText: string | null;
   ocrConfidence: number | null;
 
-  // Extraction
+  // Extractions
   extractedMerchant: string | null;
   extractedDate: string | null;
   extractedAmount: number | null;
@@ -83,15 +104,27 @@ export interface ScanAttempt {
   expectedCategory: ExpenseCategory | null;
   datasetTag: string | null;
   notes: string | null;
+
+  // Persisted Evaluation Results
+  expectedTypeStatus?: ExpectedTypeStatus;
+  classificationStatus?: ClassificationStatus;
+  merchantStatus?: ExtractionStatus;
+  dateStatus?: ExtractionStatus;
+  amountStatus?: ExtractionStatus;
+  categoryStatus?: ExtractionStatus;
+  overallStatus?: OverallStatus;
+  actionStatus?: ActionStatus;
 }
 
 export interface CalculatedEvaluation {
-  classification: ComparisonResult;
-  merchant: ComparisonResult;
-  date: ComparisonResult;
-  amount: ComparisonResult;
-  category: ComparisonResult;
-  overall: "passed" | "failed" | "pending";
+  expectedType: ExpectedTypeStatus;
+  classification: ClassificationStatus;
+  merchant: ExtractionStatus;
+  date: ExtractionStatus;
+  amount: ExtractionStatus;
+  category: ExtractionStatus;
+  overall: OverallStatus;
+  action: ActionStatus;
 }
 
 export interface EvaluationSummary {

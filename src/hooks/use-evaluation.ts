@@ -5,6 +5,7 @@ import {
   deleteAllScanAttempts,
   deleteScanAttempt,
   getScanAttempts,
+  repairAllScanAttempts,
   setAttemptGroundTruth,
 } from "@/lib/db/evaluation-service";
 import type { EvaluationGroundTruth, ScanAttempt } from "@/types/evaluation";
@@ -25,9 +26,23 @@ export function useEvaluation() {
     }
   }, []);
 
+  const repair = useCallback(async () => {
+    setLoading(true);
+    try {
+      await repairAllScanAttempts();
+      const data = await getScanAttempts();
+      setAttempts(data);
+      setLoading(false);
+    } catch {
+      setError("Failed to repair scan evaluation records.");
+      setLoading(false);
+    }
+  }, []);
+
   useEffect(() => {
     let active = true;
-    getScanAttempts()
+    repairAllScanAttempts()
+      .then(() => getScanAttempts())
       .then((data) => {
         if (!active) return;
         setAttempts(data);
@@ -69,6 +84,7 @@ export function useEvaluation() {
     loading,
     error,
     refresh,
+    repair,
     updateGroundTruth,
     removeAttempt,
     clearAll,

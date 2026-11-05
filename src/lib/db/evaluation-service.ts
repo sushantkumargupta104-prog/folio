@@ -2,16 +2,376 @@ import { getDatabase } from "@/lib/db/database";
 import { findMatchingDatasetItem } from "@/lib/evaluation/ground-truth-dataset";
 import type { ExpenseCategory } from "@/types/bill";
 import type {
+  ActionStatus,
   CalculatedEvaluation,
-  ComparisonResult,
+  ClassificationStatus,
   EvaluationGroundTruth,
   EvaluationSummary,
+  ExpectedTypeStatus,
+  ExtractionStatus,
   FailureStage,
+  OverallStatus,
   ScanAttempt,
 } from "@/types/evaluation";
 import { AppError } from "@/utils/errors";
-import { parseIsoDate } from "@/utils/format";
+import { parseIsoDate, toIsoDate } from "@/utils/format";
 import { createId } from "@/utils/id";
+
+// ----------------------------------------------------
+// COMPARISON AND EVALUATION LOGIC
+// ----------------------------------------------------
+
+export function evaluateExpectedType(attempt: ScanAttempt): ExpectedTypeStatus {
+  if (attempt.expectedIsBill === true) return "Bill";
+  if (attempt.expectedIsBill === false) return "Non-bill";
+  return "Missing ground truth";
+}
+
+export function evaluateClassification(attempt: ScanAttempt): ClassificationStatus {
+  if (attempt.predictedIsBill === null) {
+    return "Not evaluated";
+  }
+  if (attempt.expectedIsBill === null) {
+    return "Not evaluated";
+  }
+  return attempt.predictedIsBill === attempt.expectedIsBill ? "Correct" : "Incorrect";
+}
+
+export function evaluateScanAttempt(attempt: ScanAttempt): CalculatedEvaluation {
+  const expectedType = evaluateExpectedType(attempt);
+  const classification = evaluateClassification(attempt);
+
+  // Check if system failed before field extraction (e.g. genuine bill rejected or OCR failed)
+  const isExtractionUnavailable =
+    attempt.predictedIsBill === false ||
+    attempt.ocrStatus === "failed" ||
+    attempt.failureStage === "ocr" ||
+    attempt.failureStage === "detection";
+
+  // 1. Merchant extraction
+  const merchant = evaluateSingleField(
+    attempt.expectedIsBill,
+    attempt.expectedMerchant,
+    attempt.extractedMerchant,
+    compareMerchant,
+    isExtractionUnavailable,
+  );
+
+  // 2. Date extraction
+  const date = evaluateSingleField(
+    attempt.expectedIsBill,
+    attempt.expectedDate,
+    attempt.extractedDate,
+    compareDate,
+    isExtractionUnavailable,
+  );
+
+  // 3. Amount extraction
+  const amount = evaluateSingleField(
+    attempt.expectedIsBill,
+    attempt.expectedAmount,
+    attempt.extractedAmount,
+    compareAmount,
+    isExtractionUnavailable,
+  );
+
+  // 4. Category extraction
+  const category = evaluateSingleField(
+    attempt.expectedIsBill,
+    attempt.expectedCategory,
+    attempt.extractedCategory,
+    compareCategory,
+    isExtractionUnavailable,
+  );
+
+  // 5. Overall evaluation
+  const overall = evaluateOverall(attempt, classification, [
+    merchant,
+    date,
+    amount,
+    category,
+  ]);
+
+  // 6. Functional Action
+  const action = evaluateAction(attempt, overall, expectedType);
+
+  return {
+    expectedType,
+    classification,
+    merchant,
+    date,
+    amount,
+    category,
+    overall,
+    action,
+  };
+}
+
+function evaluateSingleField<T>(
+  isBill: boolean | null,
+  expectedVal: T | null,
+  extractedVal: T | null,
+  compareFn: (extracted: T, expected: T) => boolean,
+  isExtractionUnavailable: boolean,
+): ExtractionStatus {
+  // Non-bill images: extraction is Not applicable unless test data explicitly expected it
+  if (isBill === false) {
+    if (expectedVal !== null) {
+      if (extractedVal === null) return "Not extracted";
+      return compareFn(extractedVal, expectedVal) ? "Correct" : "Incorrect";
+    }
+    return "Not applicable";
+  }
+
+  // Missing ground truth (either classification or this specific field)
+  if (isBill === null || expectedVal === null) {
+    return "Awaiting ground truth";
+  }
+
+  // Genuine bill with expected value:
+  // If the bill was rejected before extraction or OCR failed, it's Not extracted
+  if (isExtractionUnavailable || extractedVal === null) {
+    return "Not extracted";
+  }
+
+  return compareFn(extractedVal, expectedVal) ? "Correct" : "Incorrect";
+}
+
+function evaluateOverall(
+  attempt: ScanAttempt,
+  classification: ClassificationStatus,
+  fieldStatuses: ExtractionStatus[],
+): OverallStatus {
+  // If ground truth is not provided, cannot evaluate overall
+  if (attempt.expectedIsBill === null) {
+    return "Awaiting ground truth";
+  }
+
+  // For non-bills, overall primarily reflects classification correctness
+  if (attempt.expectedIsBill === false) {
+    if (classification === "Correct") return "Correct";
+    if (classification === "Incorrect") return "Incorrect";
+    return "Awaiting ground truth";
+  }
+
+  // For genuine bills:
+  if (classification === "Incorrect") {
+    return "Incorrect";
+  }
+
+  if (classification === "Not evaluated") {
+    if (attempt.processingStatus === "failed" || attempt.ocrStatus === "failed") {
+      return "Incorrect";
+    }
+    return "Awaiting ground truth";
+  }
+
+  // classification is "Correct". Filter for applicable extraction checks
+  const applicable = fieldStatuses.filter(
+    (s) => s !== "Not applicable" && s !== "Awaiting ground truth",
+  );
+
+  if (applicable.length === 0) {
+    // Classification is correct, but ground truth has not yet been supplied for any field
+    return "Awaiting ground truth";
+  }
+
+  const correctCount = applicable.filter((s) => s === "Correct").length;
+  const failureCount = applicable.filter(
+    (s) => s === "Incorrect" || s === "Not extracted",
+  ).length;
+
+  if (correctCount === applicable.length) {
+    return "Correct";
+  }
+
+  if (correctCount > 0 && failureCount > 0) {
+    return "Partially correct";
+  }
+
+  return "Incorrect";
+}
+
+function evaluateAction(
+  attempt: ScanAttempt,
+  overall: OverallStatus,
+  expectedType: ExpectedTypeStatus,
+): ActionStatus {
+  if (attempt.processingStatus === "failed" || attempt.failureStage !== null) {
+    return "Retry scan";
+  }
+  if (expectedType === "Missing ground truth" || overall === "Awaiting ground truth") {
+    return "Review missing ground truth";
+  }
+  return "View details";
+}
+
+// ----------------------------------------------------
+// FIELD COMPARISON HELPERS
+// ----------------------------------------------------
+
+function normalizeString(value: string | null | undefined): string {
+  if (!value) return "";
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function compareMerchant(
+  predicted: string | null,
+  expected: string | null,
+): boolean {
+  if (predicted == null || expected == null) return false;
+
+  const predNorm = normalizeString(predicted);
+  const expNorm = normalizeString(expected);
+
+  if (!predNorm || !expNorm) return false;
+
+  // Exact match after normalization
+  if (predNorm === expNorm) return true;
+
+  // Substring match where one contains the full business name
+  if (predNorm.includes(expNorm) || expNorm.includes(predNorm)) {
+    if (Math.min(predNorm.length, expNorm.length) >= 4) {
+      return true;
+    }
+  }
+
+  // Levenshtein similarity for OCR character mistakes (e.g. "Decath1on" vs "Decathlon")
+  const similarity = stringSimilarity(predNorm, expNorm);
+  return similarity >= 0.8;
+}
+
+export function compareDate(
+  predicted: string | null,
+  expected: string | null,
+): boolean {
+  if (predicted == null || expected == null) return false;
+
+  const predIso = normalizeDateToIso(predicted);
+  const expIso = normalizeDateToIso(expected);
+
+  if (predIso && expIso) {
+    return predIso === expIso;
+  }
+
+  return predicted.trim() === expected.trim();
+}
+
+export function normalizeDateToIso(dateStr: string | null | undefined): string | null {
+  if (!dateStr) return null;
+  const clean = dateStr.trim();
+
+  // Check standard ISO YYYY-MM-DD
+  const isoParsed = parseIsoDate(clean);
+  if (isoParsed) return clean;
+
+  // Check DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+  const dmyMatch = clean.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})$/);
+  if (dmyMatch) {
+    const day = Number(dmyMatch[1]);
+    const month = Number(dmyMatch[2]);
+    let year = Number(dmyMatch[3]);
+    if (year < 100) year += year >= 70 ? 1900 : 2000;
+    return toIsoDate(year, month, day);
+  }
+
+  // Check YYYY/MM/DD
+  const ymdMatch = clean.match(/^(\d{4})[/.-](\d{1,2})[/.-](\d{1,2})$/);
+  if (ymdMatch) {
+    return toIsoDate(Number(ymdMatch[1]), Number(ymdMatch[2]), Number(ymdMatch[3]));
+  }
+
+  return null;
+}
+
+export function compareAmount(
+  predicted: number | null,
+  expected: number | null,
+): boolean {
+  if (predicted == null || expected == null) return false;
+  if (!Number.isFinite(predicted) || !Number.isFinite(expected)) return false;
+
+  const diff = Math.abs(predicted - expected);
+  return diff < 0.05;
+}
+
+export function compareCategory(
+  predicted: ExpenseCategory | string | null,
+  expected: ExpenseCategory | string | null,
+): boolean {
+  if (predicted == null || expected == null) return false;
+
+  const predNorm = canonicalCategory(predicted);
+  const expNorm = canonicalCategory(expected);
+
+  return predNorm === expNorm;
+}
+
+function canonicalCategory(cat: string): string {
+  const norm = normalizeString(cat);
+  if (norm.includes("food") || norm.includes("dining") || norm.includes("restaurant") || norm.includes("cafe")) {
+    return "food & dining";
+  }
+  if (norm.includes("grocer") || norm.includes("supermarket") || norm.includes("kirana")) {
+    return "groceries";
+  }
+  if (norm.includes("transport") || norm.includes("fuel") || norm.includes("petrol") || norm.includes("cab") || norm.includes("taxi")) {
+    return "transport";
+  }
+  if (norm.includes("health") || norm.includes("pharmacy") || norm.includes("medical") || norm.includes("doctor")) {
+    return "healthcare";
+  }
+  if (norm.includes("entertain") || norm.includes("movie") || norm.includes("cinema")) {
+    return "entertainment";
+  }
+  if (norm.includes("utilit") || norm.includes("electric") || norm.includes("recharge") || norm.includes("broadband")) {
+    return "utilities";
+  }
+  if (norm.includes("shop") || norm.includes("apparel") || norm.includes("clothing") || norm.includes("retail")) {
+    return "shopping";
+  }
+  return norm;
+}
+
+function stringSimilarity(s1: string, s2: string): number {
+  if (s1 === s2) return 1.0;
+  if (!s1 || !s2) return 0.0;
+  const longer = s1.length > s2.length ? s1 : s2;
+  const shorter = s1.length > s2.length ? s2 : s1;
+  const longerLength = longer.length;
+  if (longerLength === 0) return 1.0;
+  const distance = editDistance(longer, shorter);
+  return (longerLength - distance) / longerLength;
+}
+
+function editDistance(s1: string, s2: string): number {
+  const costs: number[] = [];
+  for (let i = 0; i <= s1.length; i++) {
+    let lastValue = i;
+    for (let j = 0; j <= s2.length; j++) {
+      if (i === 0) {
+        costs[j] = j;
+      } else if (j > 0) {
+        let newValue = costs[j - 1];
+        if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
+          newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
+        }
+        costs[j - 1] = lastValue;
+        lastValue = newValue;
+      }
+    }
+    if (i > 0) costs[s2.length] = lastValue;
+  }
+  return costs[s2.length];
+}
+
+// ----------------------------------------------------
+// DATABASE SERVICE WITH AUTOMATIC PERSISTENCE
+// ----------------------------------------------------
 
 export async function createScanAttempt(options: {
   imageFile: File | Blob;
@@ -27,7 +387,7 @@ export async function createScanAttempt(options: {
     const mimeType = options.imageFile.type || "image/png";
     const size = options.imageFile.size || 0;
 
-    // Check if filename matches a standard test dataset item
+    // Check if filename matches standard test dataset item
     const matchedDataset = findMatchingDatasetItem(fileName);
     const gt = options.groundTruth ?? matchedDataset;
 
@@ -77,6 +437,17 @@ export async function createScanAttempt(options: {
       notes: gt?.notes ?? null,
     };
 
+    // Calculate initial evaluated statuses immediately
+    const initialEval = evaluateScanAttempt(attempt);
+    attempt.expectedTypeStatus = initialEval.expectedType;
+    attempt.classificationStatus = initialEval.classification;
+    attempt.merchantStatus = initialEval.merchant;
+    attempt.dateStatus = initialEval.date;
+    attempt.amountStatus = initialEval.amount;
+    attempt.categoryStatus = initialEval.category;
+    attempt.overallStatus = initialEval.overall;
+    attempt.actionStatus = initialEval.action;
+
     await getDatabase().scanAttempts.add(attempt);
     return attempt;
   } catch (error) {
@@ -94,17 +465,132 @@ export async function updateScanAttempt(
     const existing = await db.scanAttempts.get(id);
     if (!existing) return undefined;
 
-    const updated: ScanAttempt = {
+    const merged: ScanAttempt = {
       ...existing,
       ...updates,
       updatedAt: new Date().toISOString(),
     };
 
-    await db.scanAttempts.put(updated);
-    return updated;
+    // Recalculate evaluation statuses immediately with updated values
+    const evalResult = evaluateScanAttempt(merged);
+    merged.expectedTypeStatus = evalResult.expectedType;
+    merged.classificationStatus = evalResult.classification;
+    merged.merchantStatus = evalResult.merchant;
+    merged.dateStatus = evalResult.date;
+    merged.amountStatus = evalResult.amount;
+    merged.categoryStatus = evalResult.category;
+    merged.overallStatus = evalResult.overall;
+    merged.actionStatus = evalResult.action;
+
+    await db.scanAttempts.put(merged);
+    return merged;
   } catch (error) {
     console.error("Failed to update scan attempt:", error);
     return undefined;
+  }
+}
+
+export async function recalculateAndPersistAttempt(
+  id: string,
+): Promise<ScanAttempt | undefined> {
+  const db = getDatabase();
+  const attempt = await db.scanAttempts.get(id);
+  if (!attempt) return undefined;
+
+  // Auto-fill dataset ground truth if missing but filename or datasetTag matches
+  if (attempt.expectedIsBill === null) {
+    const matched =
+      (attempt.datasetTag ? findMatchingDatasetItem(attempt.datasetTag) : undefined) ||
+      findMatchingDatasetItem(attempt.imageFileName);
+    if (matched) {
+      attempt.expectedIsBill = matched.expectedIsBill;
+      attempt.expectedMerchant = matched.expectedMerchant;
+      attempt.expectedDate = matched.expectedDate;
+      attempt.expectedAmount = matched.expectedAmount;
+      attempt.expectedCategory = matched.expectedCategory as ExpenseCategory;
+      attempt.datasetTag = matched.datasetTag ?? matched.id;
+      attempt.notes = attempt.notes ?? matched.notes ?? null;
+    }
+  }
+
+  const evalResult = evaluateScanAttempt(attempt);
+  const updated: ScanAttempt = {
+    ...attempt,
+    expectedTypeStatus: evalResult.expectedType,
+    classificationStatus: evalResult.classification,
+    merchantStatus: evalResult.merchant,
+    dateStatus: evalResult.date,
+    amountStatus: evalResult.amount,
+    categoryStatus: evalResult.category,
+    overallStatus: evalResult.overall,
+    actionStatus: evalResult.action,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await db.scanAttempts.put(updated);
+  return updated;
+}
+
+export async function repairAllScanAttempts(): Promise<{
+  repairedCount: number;
+  totalCount: number;
+}> {
+  try {
+    const db = getDatabase();
+    const attempts = await db.scanAttempts.toArray();
+    let repairedCount = 0;
+
+    for (const attempt of attempts) {
+      let updatedGt = false;
+      if (attempt.expectedIsBill === null) {
+        const matched =
+          (attempt.datasetTag ? findMatchingDatasetItem(attempt.datasetTag) : undefined) ||
+          findMatchingDatasetItem(attempt.imageFileName);
+        if (matched) {
+          attempt.expectedIsBill = matched.expectedIsBill;
+          attempt.expectedMerchant = matched.expectedMerchant;
+          attempt.expectedDate = matched.expectedDate;
+          attempt.expectedAmount = matched.expectedAmount;
+          attempt.expectedCategory = matched.expectedCategory as ExpenseCategory;
+          attempt.datasetTag = matched.datasetTag ?? matched.id;
+          attempt.notes = attempt.notes ?? matched.notes ?? null;
+          updatedGt = true;
+        }
+      }
+
+      const evalResult = evaluateScanAttempt(attempt);
+
+      const needsUpdate =
+        updatedGt ||
+        attempt.expectedTypeStatus !== evalResult.expectedType ||
+        attempt.classificationStatus !== evalResult.classification ||
+        attempt.merchantStatus !== evalResult.merchant ||
+        attempt.dateStatus !== evalResult.date ||
+        attempt.amountStatus !== evalResult.amount ||
+        attempt.categoryStatus !== evalResult.category ||
+        attempt.overallStatus !== evalResult.overall ||
+        attempt.actionStatus !== evalResult.action;
+
+      if (needsUpdate) {
+        attempt.expectedTypeStatus = evalResult.expectedType;
+        attempt.classificationStatus = evalResult.classification;
+        attempt.merchantStatus = evalResult.merchant;
+        attempt.dateStatus = evalResult.date;
+        attempt.amountStatus = evalResult.amount;
+        attempt.categoryStatus = evalResult.category;
+        attempt.overallStatus = evalResult.overall;
+        attempt.actionStatus = evalResult.action;
+        attempt.updatedAt = new Date().toISOString();
+
+        await db.scanAttempts.put(attempt);
+        repairedCount++;
+      }
+    }
+
+    return { repairedCount, totalCount: attempts.length };
+  } catch (error) {
+    console.error("Failed to repair scan attempts:", error);
+    return { repairedCount: 0, totalCount: 0 };
   }
 }
 
@@ -199,232 +685,6 @@ export async function setAttemptGroundTruth(
 }
 
 // ----------------------------------------------------
-// COMPARISON AND EVALUATION LOGIC
-// ----------------------------------------------------
-
-export function calculateEvaluation(attempt: ScanAttempt): CalculatedEvaluation {
-  const hasGroundTruth = attempt.expectedIsBill !== null;
-
-  if (!hasGroundTruth) {
-    return {
-      classification: "pending",
-      merchant: "pending",
-      date: "pending",
-      amount: "pending",
-      category: "pending",
-      overall: "pending",
-    };
-  }
-
-  // 1. Bill classification
-  let classification: ComparisonResult;
-  if (attempt.predictedIsBill === null) {
-    classification = "pending";
-  } else if (attempt.predictedIsBill === attempt.expectedIsBill) {
-    classification = "correct";
-  } else {
-    classification = "incorrect";
-  }
-
-  // If this image is expected to be a NON-BILL:
-  if (attempt.expectedIsBill === false) {
-    // For non-bills, field extraction accuracy is not applicable unless ground truth specifically expects it
-    const merchantResult =
-      attempt.expectedMerchant != null
-        ? compareMerchant(attempt.extractedMerchant, attempt.expectedMerchant)
-        : "not_applicable";
-    const dateResult =
-      attempt.expectedDate != null
-        ? compareDate(attempt.extractedDate, attempt.expectedDate)
-        : "not_applicable";
-    const amountResult =
-      attempt.expectedAmount != null
-        ? compareAmount(attempt.extractedAmount, attempt.expectedAmount)
-        : "not_applicable";
-    const categoryResult =
-      attempt.expectedCategory != null
-        ? compareCategory(attempt.extractedCategory, attempt.expectedCategory)
-        : "not_applicable";
-
-    const overall = classification === "correct" ? "passed" : "failed";
-
-    return {
-      classification,
-      merchant: merchantResult,
-      date: dateResult,
-      amount: amountResult,
-      category: categoryResult,
-      overall,
-    };
-  }
-
-  // GENUINE BILL:
-  // If genuine bill was rejected or failed before extraction:
-  // its extraction fields are marked as failed ("incorrect"), not silently excluded!
-  const billRejected = attempt.predictedIsBill === false || attempt.failureStage === "detection";
-  const ocrFailed = attempt.ocrStatus === "failed";
-
-  const merchant: ComparisonResult =
-    billRejected || ocrFailed || attempt.extractedMerchant === null
-      ? attempt.expectedMerchant != null
-        ? "incorrect"
-        : "not_applicable"
-      : compareMerchant(attempt.extractedMerchant, attempt.expectedMerchant);
-
-  const date: ComparisonResult =
-    billRejected || ocrFailed || attempt.extractedDate === null
-      ? attempt.expectedDate != null
-        ? "incorrect"
-        : "not_applicable"
-      : compareDate(attempt.extractedDate, attempt.expectedDate);
-
-  const amount: ComparisonResult =
-    billRejected || ocrFailed || attempt.extractedAmount === null
-      ? attempt.expectedAmount != null
-        ? "incorrect"
-        : "not_applicable"
-      : compareAmount(attempt.extractedAmount, attempt.expectedAmount);
-
-  const category: ComparisonResult =
-    billRejected || ocrFailed || attempt.extractedCategory === null
-      ? attempt.expectedCategory != null
-        ? "incorrect"
-        : "not_applicable"
-      : compareCategory(attempt.extractedCategory, attempt.expectedCategory);
-
-  // Overall passes if classification is correct and all expected fields that exist are correct
-  const allFieldsPassed =
-    (merchant === "correct" || merchant === "not_applicable") &&
-    (date === "correct" || date === "not_applicable") &&
-    (amount === "correct" || amount === "not_applicable") &&
-    (category === "correct" || category === "not_applicable");
-
-  const overall = classification === "correct" && allFieldsPassed ? "passed" : "failed";
-
-  return {
-    classification,
-    merchant,
-    date,
-    amount,
-    category,
-    overall,
-  };
-}
-
-function normalizeString(value: string | null | undefined): string {
-  if (!value) return "";
-  return value
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-export function compareMerchant(
-  predicted: string | null,
-  expected: string | null,
-): ComparisonResult {
-  if (expected == null) return "not_applicable";
-  if (!predicted) return "incorrect";
-
-  const predNorm = normalizeString(predicted);
-  const expNorm = normalizeString(expected);
-
-  if (!predNorm || !expNorm) return "incorrect";
-
-  // Exact match after normalization
-  if (predNorm === expNorm) return "correct";
-
-  // Substring match where one contains the full business name (e.g. "Starbucks Coffee" vs "Starbucks")
-  if (predNorm.includes(expNorm) || expNorm.includes(predNorm)) {
-    // Ensure it's not a trivial 1-2 char match
-    if (Math.min(predNorm.length, expNorm.length) >= 4) {
-      return "correct";
-    }
-  }
-
-  // Levenshtein similarity for OCR character mistakes (e.g. "Decath1on" vs "Decathlon")
-  const similarity = stringSimilarity(predNorm, expNorm);
-  if (similarity >= 0.8) return "correct";
-
-  return "incorrect";
-}
-
-export function compareDate(
-  predicted: string | null,
-  expected: string | null,
-): ComparisonResult {
-  if (expected == null) return "not_applicable";
-  if (!predicted) return "incorrect";
-
-  // Normalize both dates to YYYY-MM-DD
-  const predParsed = parseIsoDate(predicted);
-  const expParsed = parseIsoDate(expected);
-
-  if (predParsed && expParsed) {
-    return predParsed.toISOString().slice(0, 10) === expParsed.toISOString().slice(0, 10)
-      ? "correct"
-      : "incorrect";
-  }
-
-  return predicted.trim() === expected.trim() ? "correct" : "incorrect";
-}
-
-export function compareAmount(
-  predicted: number | null,
-  expected: number | null,
-): ComparisonResult {
-  if (expected == null) return "not_applicable";
-  if (predicted == null || !Number.isFinite(predicted)) return "incorrect";
-
-  // Numeric comparison within 0.05 currency tolerance (cents / paise rounding)
-  const diff = Math.abs(predicted - expected);
-  return diff < 0.05 ? "correct" : "incorrect";
-}
-
-export function compareCategory(
-  predicted: ExpenseCategory | string | null,
-  expected: ExpenseCategory | string | null,
-): ComparisonResult {
-  if (expected == null) return "not_applicable";
-  if (!predicted) return "incorrect";
-
-  return normalizeString(predicted) === normalizeString(expected) ? "correct" : "incorrect";
-}
-
-function stringSimilarity(s1: string, s2: string): number {
-  if (s1 === s2) return 1.0;
-  if (!s1 || !s2) return 0.0;
-  const longer = s1.length > s2.length ? s1 : s2;
-  const shorter = s1.length > s2.length ? s2 : s1;
-  const longerLength = longer.length;
-  if (longerLength === 0) return 1.0;
-  const distance = editDistance(longer, shorter);
-  return (longerLength - distance) / longerLength;
-}
-
-function editDistance(s1: string, s2: string): number {
-  const costs: number[] = [];
-  for (let i = 0; i <= s1.length; i++) {
-    let lastValue = i;
-    for (let j = 0; j <= s2.length; j++) {
-      if (i === 0) {
-        costs[j] = j;
-      } else if (j > 0) {
-        let newValue = costs[j - 1];
-        if (s1.charAt(i - 1) !== s2.charAt(j - 1)) {
-          newValue = Math.min(Math.min(newValue, lastValue), costs[j]) + 1;
-        }
-        costs[j - 1] = lastValue;
-        lastValue = newValue;
-      }
-    }
-    if (i > 0) costs[s2.length] = lastValue;
-  }
-  return costs[s2.length];
-}
-
-// ----------------------------------------------------
 // SUMMARY METRICS CALCULATION
 // ----------------------------------------------------
 
@@ -456,36 +716,55 @@ export function calculateEvaluationSummary(attempts: ScanAttempt[]): EvaluationS
       billDetectionRejections += 1;
     }
 
-    if (attempt.expectedIsBill === null) continue;
-    totalWithGroundTruth += 1;
-
-    const evalResult = calculateEvaluation(attempt);
-
-    // Classification
-    classificationEligibleCount += 1;
-    if (evalResult.classification === "correct") {
-      correctClassifications += 1;
+    if (attempt.expectedIsBill !== null) {
+      totalWithGroundTruth += 1;
     }
 
-    // Extractions: only count towards eligible denominator if field is applicable
-    if (evalResult.merchant !== "not_applicable" && evalResult.merchant !== "pending") {
+    const evalResult = evaluateScanAttempt(attempt);
+
+    // Classification accuracy
+    if (evalResult.classification !== "Not evaluated") {
+      classificationEligibleCount += 1;
+      if (evalResult.classification === "Correct") {
+        correctClassifications += 1;
+      }
+    }
+
+    // Extractions accuracy: only count towards eligible denominator if applicable
+    if (
+      evalResult.merchant === "Correct" ||
+      evalResult.merchant === "Incorrect" ||
+      evalResult.merchant === "Not extracted"
+    ) {
       merchantEligibleCount += 1;
-      if (evalResult.merchant === "correct") merchantCorrectCount += 1;
+      if (evalResult.merchant === "Correct") merchantCorrectCount += 1;
     }
 
-    if (evalResult.date !== "not_applicable" && evalResult.date !== "pending") {
+    if (
+      evalResult.date === "Correct" ||
+      evalResult.date === "Incorrect" ||
+      evalResult.date === "Not extracted"
+    ) {
       dateEligibleCount += 1;
-      if (evalResult.date === "correct") dateCorrectCount += 1;
+      if (evalResult.date === "Correct") dateCorrectCount += 1;
     }
 
-    if (evalResult.amount !== "not_applicable" && evalResult.amount !== "pending") {
+    if (
+      evalResult.amount === "Correct" ||
+      evalResult.amount === "Incorrect" ||
+      evalResult.amount === "Not extracted"
+    ) {
       amountEligibleCount += 1;
-      if (evalResult.amount === "correct") amountCorrectCount += 1;
+      if (evalResult.amount === "Correct") amountCorrectCount += 1;
     }
 
-    if (evalResult.category !== "not_applicable" && evalResult.category !== "pending") {
+    if (
+      evalResult.category === "Correct" ||
+      evalResult.category === "Incorrect" ||
+      evalResult.category === "Not extracted"
+    ) {
       categoryEligibleCount += 1;
-      if (evalResult.category === "correct") categoryCorrectCount += 1;
+      if (evalResult.category === "Correct") categoryCorrectCount += 1;
     }
   }
 
@@ -545,29 +824,31 @@ export function exportEvaluationCsv(attempts: ScanAttempt[]): string {
     "image_size_bytes",
     "created_at",
     "processing_status",
+    "expected_type",
     "expected_is_bill",
     "predicted_is_bill",
     "bill_detection_confidence",
-    "classification_correct",
+    "classification_status",
     "ocr_status",
     "ocr_confidence",
     "expected_merchant",
     "extracted_merchant",
     "merchant_confidence",
-    "merchant_correct",
+    "merchant_status",
     "expected_date",
     "extracted_date",
     "date_confidence",
-    "date_correct",
+    "date_status",
     "expected_amount",
     "extracted_amount",
     "amount_confidence",
-    "amount_correct",
+    "amount_status",
     "expected_category",
     "extracted_category",
     "category_confidence",
-    "category_correct",
-    "overall_evaluation",
+    "category_status",
+    "overall_status",
+    "action_status",
     "failure_stage",
     "failure_reason",
     "is_saved_as_bill",
@@ -576,7 +857,7 @@ export function exportEvaluationCsv(attempts: ScanAttempt[]): string {
   ];
 
   const rows = attempts.map((attempt) => {
-    const evalResult = calculateEvaluation(attempt);
+    const evalResult = evaluateScanAttempt(attempt);
     return [
       escapeCsv(attempt.id),
       escapeCsv(attempt.datasetTag ?? ""),
@@ -585,6 +866,7 @@ export function exportEvaluationCsv(attempts: ScanAttempt[]): string {
       attempt.imageSize,
       escapeCsv(attempt.createdAt),
       escapeCsv(attempt.processingStatus),
+      escapeCsv(evalResult.expectedType),
       attempt.expectedIsBill === null ? "" : attempt.expectedIsBill ? "true" : "false",
       attempt.predictedIsBill === null ? "" : attempt.predictedIsBill ? "true" : "false",
       attempt.billDetectionConfidence ?? "",
@@ -608,6 +890,7 @@ export function exportEvaluationCsv(attempts: ScanAttempt[]): string {
       attempt.categoryConfidence ?? "",
       escapeCsv(evalResult.category),
       escapeCsv(evalResult.overall),
+      escapeCsv(evalResult.action),
       escapeCsv(attempt.failureStage ?? ""),
       escapeCsv(attempt.failureReason ?? ""),
       attempt.isSavedAsBill ? "true" : "false",
